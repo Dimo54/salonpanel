@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="sr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Zakazivanje - {{ settings.business_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body class="booking-body">
+    <main class="booking-shell">
+        <section class="booking-hero">
+            <span class="eyebrow">Online zakazivanje</span>
+            <h1>{{ settings.business_name }}</h1>
+            <p>{{ settings.booking_note }}</p>
+            <div class="booking-info">
+                <div><span>Telefon</span><strong>{{ settings.phone }}</strong></div>
+                <div><span>Lokacija</span><strong>{{ settings.address }}</strong></div>
+                <div><span>Radno vreme</span><strong>{{ settings.working_hours }}</strong></div>
+            </div>
+        </section>
+
+        <section class="booking-card">
+            <h2>Posaljite zahtev za termin</h2>
+            <p>Unesite podatke. Termin je aktivan tek kada ga salon potvrdi.</p>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    <div class="flash-stack compact">
+                        {% for category, message in messages %}
+                            <div class="flash flash-{{ category }}">{{ message }}</div>
+                        {% endfor %}
+                    </div>
+                {% endif %}
+            {% endwith %}
+
+            <form method="post" class="form-stack">
+                <label>
+                    Ime i prezime
+                    <input type="text" name="client_name" placeholder="npr. Nikola Petrovic" required>
+                </label>
+                <label>
+                    Telefon
+                    <input type="tel" name="client_phone" placeholder="061..." required>
+                </label>
+                <label>
+                    Usluga
+                    <select name="service_id" required>
+                        <option value="">Izaberite uslugu</option>
+                        {% for service in services %}
+                        <option value="{{ service.id }}">{{ service.name }} - {{ service.price|money }} / {{ service.duration_minutes }} min</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <div class="booking-row">
+                    <label>
+                        Datum
+                        <input type="date" name="date" min="{{ today_iso }}" required>
+                    </label>
+                    <label>
+                        Vreme
+                        <input type="time" name="time" min="{{ settings.open_time }}" max="{{ settings.close_time }}" required>
+                    </label>
+                </div>
+                <label>
+                    Napomena
+                    <textarea name="notes" rows="3" placeholder="Npr. zelim ranije ako se oslobodi termin"></textarea>
+                </label>
+                <button class="btn btn-primary full" type="submit">Posalji zahtev</button>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

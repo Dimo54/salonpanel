@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Super admin - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <span class="eyebrow">Vlasnicki panel</span>
+        <h1>Super admin</h1>
+        <p class="lead">Pregled svih salona, pretplata i poslovnih metrika platforme.</p>
+    </div>
+    <div class="head-actions">
+        <a class="btn btn-secondary" href="{{ url_for('register') }}" target="_blank">Link za registraciju</a>
+        <a class="btn btn-primary" href="{{ url_for('super_admin_salons') }}">Svi saloni</a>
+    </div>
+</div>
+
+<section class="stat-grid">
+    <article class="stat-card glow">
+        <span>Ukupno salona</span>
+        <strong>{{ stats.total_salons }}</strong>
+        <small>Svi registrovani saloni</small>
+    </article>
+    <article class="stat-card">
+        <span>Aktivni</span>
+        <strong>{{ stats.active_salons }}</strong>
+        <small>Placaju ili su rucno aktivni</small>
+    </article>
+    <article class="stat-card">
+        <span>Trial</span>
+        <strong>{{ stats.trial_salons }}</strong>
+        <small>Probni period</small>
+    </article>
+    <article class="stat-card">
+        <span>Problem</span>
+        <strong>{{ stats.problem_salons }}</strong>
+        <small>Kasni placanje ili blokirani</small>
+    </article>
+    <article class="stat-card">
+        <span>Zahtevi</span>
+        <strong>{{ pending_requests }}</strong>
+        <small>Ukupno termina na cekanju</small>
+    </article>
+</section>
+
+<div class="content-grid two-one">
+    <section class="panel">
+        <div class="panel-head">
+            <div>
+                <h2>Novi saloni</h2>
+                <p>Poslednjih 8 registrovanih naloga.</p>
+            </div>
+            <a href="{{ url_for('super_admin_salons') }}">Svi saloni</a>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Salon</th>
+                        <th>Vlasnik</th>
+                        <th>Status</th>
+                        <th>Paket</th>
+                        <th>Datum</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for salon in recent_salons %}
+                    <tr>
+                        <td><a href="{{ url_for('super_admin_salon_detail', salon_id=salon.id) }}"><strong>{{ salon.name }}</strong></a><small>/s/{{ salon.slug }}/zakazi</small></td>
+                        <td>{{ salon.owner_name }}<small>{{ salon.owner_email }}</small></td>
+                        <td><span class="badge status-scheduled">{{ salon.subscription_status|subscription_label }}</span></td>
+                        <td>{{ plan_labels.get(salon.subscription_plan, salon.subscription_plan) }}</td>
+                        <td>{{ salon.created_at|date_sr }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="5" class="empty-cell">Jos nema registrovanih salona.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section class="panel accent-panel">
+        <h2>Prihod - procena</h2>
+        <p>Dok ne povezemo Paddle, ovo je procena na osnovu rucno postavljenih aktivnih paketa.</p>
+        <div class="mini-list">
+            <div><span>Mesecni aktivni</span><strong>{{ stats.monthly_salons }} x {{ monthly_price_eur }} EUR = {{ calculated.mrr }} EUR / mesec</strong></div>
+            <div><span>Godisnji aktivni</span><strong>{{ stats.yearly_salons }} x {{ yearly_price_eur }} EUR = {{ calculated.arr }} EUR / godina</strong></div>
+            <div><span>Sledeci korak</span><strong>Paddle checkout + webhook za automatsku aktivaciju</strong></div>
+        </div>
+    </section>
+</div>
+{% endblock %}

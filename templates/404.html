@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Stranica nije pronadjena - {{ app_name }}{% endblock %}
+{% block content %}
+<section class="panel empty-page">
+    <h1>404</h1>
+    <p>Stranica koju trazite ne postoji.</p>
+    {% if current_user and current_user.role == 'super_admin' and not current_salon %}
+    <a class="btn btn-primary" href="{{ url_for('super_admin_dashboard') }}">Nazad na super admin</a>
+    {% elif current_user %}
+    <a class="btn btn-primary" href="{{ url_for('dashboard') }}">Nazad na dashboard</a>
+    {% else %}
+    <a class="btn btn-primary" href="{{ url_for('login') }}">Prijava</a>
+    {% endif %}
+</section>
+{% endblock %}

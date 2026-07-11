@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Termini - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <span class="eyebrow">Zakazivanje</span>
+        <h1>Termini</h1>
+        <p class="lead">Dodaj, potvrdi, zavrsi ili otkazi termin.</p>
+    </div>
+    <div class="head-actions">
+        <a class="btn btn-secondary" href="{{ url_for('export_appointments') }}">Export CSV</a>
+        <a class="btn btn-primary" href="{{ url_for('appointment_new') }}">+ Novi termin</a>
+    </div>
+</div>
+
+<section class="panel filters-panel">
+    <form class="filter-form" method="get">
+        <label>
+            Pretraga
+            <input type="search" name="q" placeholder="Ime, telefon, usluga" value="{{ filters.q }}">
+        </label>
+        <label>
+            Datum
+            <input type="date" name="date" value="{{ filters.date }}">
+        </label>
+        <label>
+            Status
+            <select name="status">
+                <option value="">Svi statusi</option>
+                {% for key, label in status_labels.items() %}
+                    <option value="{{ key }}" {% if filters.status == key %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <button class="btn btn-secondary" type="submit">Filtriraj</button>
+        <a class="btn btn-ghost" href="{{ url_for('appointments') }}">Reset</a>
+    </form>
+</section>
+
+<section class="panel">
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Datum</th>
+                    <th>Vreme</th>
+                    <th>Klijent</th>
+                    <th>Usluga</th>
+                    <th>Cena</th>
+                    <th>Status</th>
+                    <th>Akcije</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in appointments %}
+                <tr>
+                    <td>{{ item.date|date_sr }}</td>
+                    <td>{{ item.time|time_short }}</td>
+                    <td>
+                        <strong>{{ item.client_name }}</strong>
+                        <small>{{ item.client_phone or '-' }}</small>
+                    </td>
+                    <td>{{ item.service_name }}</td>
+                    <td>{{ item.price|money }}</td>
+                    <td><span class="badge {{ item.status|status_class }}">{{ item.status|status_label }}</span></td>
+                    <td>
+                        <div class="actions">
+                            <a class="btn btn-mini" href="{{ url_for('appointment_edit', appointment_id=item.id) }}">Izmeni</a>
+                            {% if item.status == 'pending' %}
+                            <form method="post" action="{{ url_for('appointment_status', appointment_id=item.id) }}">
+                                <input type="hidden" name="status" value="scheduled">
+                                <button class="btn btn-mini btn-green" type="submit">Potvrdi</button>
+                            </form>
+                            {% endif %}
+                            {% if item.status in ['pending', 'scheduled'] %}
+                            <form method="post" action="{{ url_for('appointment_status', appointment_id=item.id) }}">
+                                <input type="hidden" name="status" value="completed">
+                                <button class="btn btn-mini btn-green" type="submit">Zavrseno</button>
+                            </form>
+                            <form method="post" action="{{ url_for('appointment_status', appointment_id=item.id) }}">
+                                <input type="hidden" name="status" value="cancelled">
+                                <button class="btn btn-mini btn-danger" type="submit">Otkazi</button>
+                            </form>
+                            {% endif %}
+                            <form method="post" action="{{ url_for('appointment_delete', appointment_id=item.id) }}" data-confirm="Obrisati termin?">
+                                <button class="btn btn-mini btn-ghost" type="submit">Obrisi</button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="empty-cell">Nema termina za izabrane filtere.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</section>
+{% endblock %}
