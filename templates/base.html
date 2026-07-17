@@ -59,6 +59,8 @@
                 <a class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}">Dashboard</a>
                 <a class="nav-link {% if request.endpoint in ['appointments', 'appointment_new', 'appointment_edit'] %}active{% endif %}" href="{{ url_for('appointments') }}">Termini</a>
                 <a class="nav-link {% if request.endpoint == 'clients' %}active{% endif %}" href="{{ url_for('clients') }}">Klijenti</a>
+                <a class="nav-link {% if request.endpoint in ['workers', 'worker_new', 'worker_edit'] %}active{% endif %}" href="{{ url_for('workers') }}">Radnici</a>
+                <a class="nav-link {% if request.endpoint in ['worker_calendar', 'worker_time_off_delete'] %}active{% endif %}" href="{{ url_for('worker_calendar') }}">Kalendar</a>
                 <a class="nav-link {% if request.endpoint in ['services', 'service_new', 'service_edit'] %}active{% endif %}" href="{{ url_for('services') }}">Usluge</a>
                 <a class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}" href="{{ url_for('settings_page') }}">Podesavanja</a>
                 <a class="nav-link {% if request.endpoint == 'subscription_page' %}active{% endif %}" href="{{ url_for('subscription_page') }}">Pretplata</a>

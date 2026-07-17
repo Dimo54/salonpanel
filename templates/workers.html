@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Radnici - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <span class="eyebrow">Tim salona</span>
+        <h1>Radnici</h1>
+        <p class="lead">Za svakog radnika odredi usluge, cenu i trajanje. Različiti radnici mogu imati termine u isto vreme.</p>
+    </div>
+    <div class="head-actions">
+        <a class="btn btn-secondary" href="{{ url_for('worker_calendar') }}">Kalendar odsustava</a>
+        <a class="btn btn-primary" href="{{ url_for('worker_new') }}">+ Dodaj radnika</a>
+    </div>
+</div>
+
+<section class="worker-grid">
+    {% for worker in workers %}
+    <article class="worker-card {% if not worker.active %}muted-card{% endif %}">
+        <div class="worker-card-head">
+            <div class="worker-avatar">{{ worker.name[:1]|upper }}</div>
+            <div>
+                <h3>{{ worker.name }}</h3>
+                <p>{{ worker.phone or worker.email or 'Kontakt nije unet' }}</p>
+            </div>
+            <span class="badge {% if worker.active %}status-completed{% else %}status-cancelled{% endif %}">
+                {% if worker.active %}Aktivan{% else %}Neaktivan{% endif %}
+            </span>
+        </div>
+
+        <div class="worker-stats">
+            <div><span>Usluge</span><strong>{{ worker.service_count }}</strong></div>
+            <div><span>Naredni termini</span><strong>{{ worker.upcoming_count }}</strong></div>
+        </div>
+
+        <div class="worker-services-preview">
+            <span>Radi</span>
+            <p>{{ worker.service_names or 'Nijedna usluga još nije dodeljena.' }}</p>
+        </div>
+        {% if worker.notes %}<p class="worker-note">{{ worker.notes }}</p>{% endif %}
+
+        <div class="actions service-actions">
+            <a class="btn btn-mini" href="{{ url_for('worker_edit', worker_id=worker.id) }}">Uredi</a>
+            <a class="btn btn-mini btn-secondary" href="{{ url_for('worker_calendar', worker_id=worker.id) }}">Odsustva</a>
+            <form method="post" action="{{ url_for('worker_toggle', worker_id=worker.id) }}">
+                <button class="btn btn-mini btn-secondary" type="submit">{% if worker.active %}Deaktiviraj{% else %}Aktiviraj{% endif %}</button>
+            </form>
+            <form method="post" action="{{ url_for('worker_delete', worker_id=worker.id) }}" data-confirm="Obrisati radnika?">
+                <button class="btn btn-mini btn-ghost" type="submit">Obriši</button>
+            </form>
+        </div>
+    </article>
+    {% else %}
+    <section class="panel"><p class="empty-cell">Još nema radnika.</p></section>
+    {% endfor %}
+</section>
+{% endblock %}

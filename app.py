@@ -1,11 +1,13 @@
 import csv
+import calendar as calendar_module
 import io
 import os
 import re
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from functools import wraps
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.rows import dict_row
@@ -14,6 +16,7 @@ from flask import (
     Response,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -26,6 +29,8 @@ APP_NAME = "SalonPanel"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
 MONTHLY_PRICE_EUR = int(os.environ.get("MONTHLY_PRICE_EUR", "10"))
 YEARLY_PRICE_EUR = int(os.environ.get("YEARLY_PRICE_EUR", "80"))
+APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Europe/Belgrade")
+BOOKING_SLOT_MINUTES = 10
 
 app = Flask(__name__, instance_relative_config=True)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-secret-key")
@@ -72,7 +77,8 @@ DEFAULT_SALON_SETTINGS = {
     "booking_note": "Posaljite zahtev za termin. Salon potvrdjuje termin porukom ili pozivom.",
     "open_time": "09:00",
     "close_time": "20:00",
-    "slot_minutes": 30,
+    "slot_minutes": BOOKING_SLOT_MINUTES,
+    "booking_mode": "manual",
 }
 
 DEFAULT_SERVICES = [
@@ -137,6 +143,17 @@ def db_execute_many(query, rows):
     get_db().commit()
 
 
+def local_now():
+    try:
+        return datetime.now(ZoneInfo(APP_TIMEZONE))
+    except Exception:
+        return datetime.now()
+
+
+def local_today():
+    return local_now().date()
+
+
 def init_db():
     schema = """
     CREATE TABLE IF NOT EXISTS salons (
@@ -152,7 +169,8 @@ def init_db():
         booking_note TEXT DEFAULT '',
         open_time TEXT NOT NULL DEFAULT '09:00',
         close_time TEXT NOT NULL DEFAULT '20:00',
-        slot_minutes INTEGER NOT NULL DEFAULT 30,
+        slot_minutes INTEGER NOT NULL DEFAULT 10,
+        booking_mode TEXT NOT NULL DEFAULT 'manual',
         owner_name TEXT DEFAULT '',
         owner_email TEXT DEFAULT '',
         subscription_status TEXT NOT NULL DEFAULT 'trial',
@@ -197,13 +215,53 @@ def init_db():
         UNIQUE (salon_id, name)
     );
 
+    CREATE TABLE IF NOT EXISTS workers (
+        id SERIAL PRIMARY KEY,
+        salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        phone TEXT DEFAULT '',
+        email TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        is_default BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS worker_services (
+        worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+        service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+        price NUMERIC(12,2) NOT NULL DEFAULT 0,
+        duration_minutes INTEGER NOT NULL DEFAULT 30,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (worker_id, service_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS worker_time_off (
+        id SERIAL PRIMARY KEY,
+        salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
+        worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        start_time TIME,
+        end_time TIME,
+        all_day BOOLEAN NOT NULL DEFAULT TRUE,
+        reason TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CHECK (end_date >= start_date)
+    );
+
     CREATE TABLE IF NOT EXISTS appointments (
         id SERIAL PRIMARY KEY,
         salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
         client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
         service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE RESTRICT,
+        worker_id INTEGER REFERENCES workers(id) ON DELETE RESTRICT,
         date DATE NOT NULL,
         time TIME NOT NULL,
+        duration_minutes INTEGER NOT NULL DEFAULT 30,
         price NUMERIC(12,2) NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'scheduled',
         source TEXT NOT NULL DEFAULT 'admin',
@@ -221,15 +279,33 @@ def init_db():
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    ALTER TABLE salons ADD COLUMN IF NOT EXISTS booking_mode TEXT NOT NULL DEFAULT 'manual';
+    ALTER TABLE salons ALTER COLUMN slot_minutes SET DEFAULT 10;
+    ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS worker_id INTEGER REFERENCES workers(id) ON DELETE RESTRICT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 30;
+
+    UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
+    UPDATE appointments a
+    SET duration_minutes = s.duration_minutes
+    FROM services s
+    WHERE a.service_id = s.id AND a.worker_id IS NULL;
+
     CREATE INDEX IF NOT EXISTS idx_users_salon_id ON users(salon_id);
     CREATE INDEX IF NOT EXISTS idx_clients_salon_id ON clients(salon_id);
     CREATE INDEX IF NOT EXISTS idx_services_salon_id ON services(salon_id);
+    CREATE INDEX IF NOT EXISTS idx_workers_salon_id ON workers(salon_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_one_default ON workers(salon_id) WHERE is_default = TRUE;
+    CREATE INDEX IF NOT EXISTS idx_worker_services_service_id ON worker_services(service_id);
+    CREATE INDEX IF NOT EXISTS idx_worker_time_off_lookup ON worker_time_off(worker_id, start_date, end_date);
     CREATE INDEX IF NOT EXISTS idx_appointments_salon_date ON appointments(salon_id, date, time);
+    CREATE INDEX IF NOT EXISTS idx_appointments_worker_date ON appointments(worker_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
     """
     with get_db().cursor() as cur:
         cur.execute(schema)
     get_db().commit()
+    ensure_default_workers()
     seed_super_admin()
 
 
@@ -292,6 +368,60 @@ def create_default_services(salon_id: int):
     )
 
 
+def ensure_salon_default_worker(salon_id: int):
+    worker = db_query(
+        "SELECT * FROM workers WHERE salon_id = %s ORDER BY is_default DESC, id ASC LIMIT 1",
+        (salon_id,),
+        one=True,
+    )
+    if not worker:
+        db_execute(
+            """
+            INSERT INTO workers (salon_id, name, active, is_default, created_at, updated_at)
+            VALUES (%s, 'Glavni radnik', TRUE, TRUE, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (salon_id, datetime.now(), datetime.now()),
+        )
+        worker = db_query(
+            "SELECT * FROM workers WHERE salon_id = %s ORDER BY is_default DESC, id ASC LIMIT 1",
+            (salon_id,),
+            one=True,
+        )
+
+    if not worker:
+        return None
+
+    assignment_count = db_query(
+        "SELECT COUNT(*) AS total FROM worker_services WHERE worker_id = %s",
+        (worker["id"],),
+        one=True,
+    )["total"]
+    if worker.get("is_default") and assignment_count == 0:
+        db_execute(
+            """
+            INSERT INTO worker_services
+                (worker_id, service_id, price, duration_minutes, active, created_at, updated_at)
+            SELECT %s, s.id, s.price, s.duration_minutes, TRUE, %s, %s
+            FROM services s
+            WHERE s.salon_id = %s
+            ON CONFLICT (worker_id, service_id) DO NOTHING
+            """,
+            (worker["id"], datetime.now(), datetime.now(), salon_id),
+        )
+
+    db_execute(
+        "UPDATE appointments SET worker_id = %s WHERE salon_id = %s AND worker_id IS NULL",
+        (worker["id"], salon_id),
+    )
+    return worker["id"]
+
+
+def ensure_default_workers():
+    for salon in db_query("SELECT id FROM salons ORDER BY id"):
+        ensure_salon_default_worker(salon["id"])
+
+
 def current_user():
     user_id = session.get("user_id")
     if not user_id:
@@ -326,7 +456,8 @@ def salon_settings(salon):
         "booking_note": salon["booking_note"] or DEFAULT_SALON_SETTINGS["booking_note"],
         "open_time": salon["open_time"] or DEFAULT_SALON_SETTINGS["open_time"],
         "close_time": salon["close_time"] or DEFAULT_SALON_SETTINGS["close_time"],
-        "slot_minutes": salon["slot_minutes"] or DEFAULT_SALON_SETTINGS["slot_minutes"],
+        "slot_minutes": BOOKING_SLOT_MINUTES,
+        "booking_mode": salon.get("booking_mode") or DEFAULT_SALON_SETTINGS["booking_mode"],
     }
 
 
@@ -343,7 +474,7 @@ def subscription_is_allowed(salon) -> bool:
                 trial_ends_at = datetime.strptime(trial_ends_at, "%Y-%m-%d").date()
             except ValueError:
                 return False
-        return bool(trial_ends_at and trial_ends_at >= date.today())
+        return bool(trial_ends_at and trial_ends_at >= local_today())
     return False
 
 
@@ -353,7 +484,7 @@ def subscription_days_left(salon):
     trial_ends_at = salon["trial_ends_at"]
     if isinstance(trial_ends_at, str):
         trial_ends_at = datetime.strptime(trial_ends_at, "%Y-%m-%d").date()
-    return (trial_ends_at - date.today()).days
+    return (trial_ends_at - local_today()).days
 
 
 @app.context_processor
@@ -370,7 +501,7 @@ def inject_globals():
         "plan_labels": PLAN_LABELS,
         "subscription_is_allowed": subscription_is_allowed(salon),
         "subscription_days_left": subscription_days_left(salon),
-        "today_iso": date.today().isoformat(),
+        "today_iso": local_today().isoformat(),
         "monthly_price_eur": MONTHLY_PRICE_EUR,
         "yearly_price_eur": YEARLY_PRICE_EUR,
     }
@@ -484,7 +615,25 @@ def super_admin_required(view):
 def parse_price(value, fallback=0):
     if value is None or value == "":
         return float(fallback or 0)
-    normalized = str(value).replace(".", "").replace(",", ".")
+
+    text = re.sub(r"[^0-9,.+-]", "", str(value).strip())
+    if not text:
+        return float(fallback or 0)
+
+    if "." in text and "," in text:
+        if text.rfind(",") > text.rfind("."):
+            normalized = text.replace(".", "").replace(",", ".")
+        else:
+            normalized = text.replace(",", "")
+    elif "," in text:
+        decimal_digits = len(text.rsplit(",", 1)[1])
+        normalized = text.replace(",", ".") if text.count(",") == 1 and decimal_digits in (1, 2) else text.replace(",", "")
+    elif "." in text:
+        decimal_digits = len(text.rsplit(".", 1)[1])
+        normalized = text if text.count(".") == 1 and decimal_digits in (1, 2) else text.replace(".", "")
+    else:
+        normalized = text
+
     try:
         return float(normalized)
     except ValueError:
@@ -531,18 +680,402 @@ def get_or_create_client(salon_id, name, phone=None, email=None, notes=None):
     return row["id"]
 
 
-def exact_time_conflict(salon_id, appointment_date, appointment_time, exclude_id=None):
-    params = [salon_id, appointment_date, appointment_time]
+def query_rows(query, args=None, one=False, cursor=None):
+    if cursor is None:
+        return db_query(query, args, one=one)
+    cursor.execute(query, args or [])
+    rows = cursor.fetchall()
+    if one:
+        return rows[0] if rows else None
+    return rows
+
+
+def parse_iso_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def time_to_minutes(value):
+    if isinstance(value, datetime):
+        value = value.time()
+    if isinstance(value, time):
+        return value.hour * 60 + value.minute
+    if value is None:
+        return None
+    text = str(value).strip()
+    try:
+        hour, minute = text[:5].split(":")
+        hour = int(hour)
+        minute = int(minute)
+    except (ValueError, TypeError):
+        return None
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        return None
+    return hour * 60 + minute
+
+
+def minutes_to_time(value):
+    value = int(value)
+    return f"{value // 60:02d}:{value % 60:02d}"
+
+
+def intervals_overlap(start_a, end_a, start_b, end_b):
+    return start_a < end_b and end_a > start_b
+
+
+def worker_service_assignment(salon_id, worker_id, service_id, active_only=True, cursor=None):
     sql = """
-        SELECT a.*, c.name AS client_name
+        SELECT
+            ws.worker_id,
+            ws.service_id,
+            ws.price AS worker_price,
+            ws.duration_minutes AS worker_duration_minutes,
+            ws.active AS assignment_active,
+            w.name AS worker_name,
+            w.active AS worker_active,
+            s.name AS service_name,
+            s.active AS service_active
+        FROM worker_services ws
+        JOIN workers w ON w.id = ws.worker_id
+        JOIN services s ON s.id = ws.service_id
+        WHERE w.salon_id = %s AND s.salon_id = %s AND w.id = %s AND s.id = %s
+    """
+    params = [salon_id, salon_id, worker_id, service_id]
+    if active_only:
+        sql += " AND w.active = TRUE AND s.active = TRUE AND ws.active = TRUE"
+    return query_rows(sql, params, one=True, cursor=cursor)
+
+
+def appointment_conflict(
+    salon_id,
+    worker_id,
+    appointment_date,
+    appointment_time,
+    duration_minutes,
+    exclude_id=None,
+    cursor=None,
+):
+    start_minutes = time_to_minutes(appointment_time)
+    if start_minutes is None:
+        return None
+    end_minutes = start_minutes + int(duration_minutes or 0)
+    params = [salon_id, worker_id, appointment_date]
+    sql = """
+        SELECT a.id, a.time, a.duration_minutes, c.name AS client_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
-        WHERE a.salon_id = %s AND a.date = %s AND a.time = %s AND a.status IN ('pending', 'scheduled')
+        WHERE a.salon_id = %s
+          AND a.worker_id = %s
+          AND a.date = %s
+          AND a.status IN ('pending', 'scheduled')
     """
     if exclude_id:
         sql += " AND a.id != %s"
         params.append(exclude_id)
-    return db_query(sql, params, one=True)
+    for row in query_rows(sql, params, cursor=cursor):
+        existing_start = time_to_minutes(row["time"])
+        existing_end = existing_start + int(row.get("duration_minutes") or 30)
+        if intervals_overlap(start_minutes, end_minutes, existing_start, existing_end):
+            return row
+    return None
+
+
+def worker_time_off_conflict(
+    salon_id,
+    worker_id,
+    appointment_date,
+    appointment_time,
+    duration_minutes,
+    cursor=None,
+):
+    start_minutes = time_to_minutes(appointment_time)
+    if start_minutes is None:
+        return None
+    end_minutes = start_minutes + int(duration_minutes or 0)
+    rows = query_rows(
+        """
+        SELECT *
+        FROM worker_time_off
+        WHERE salon_id = %s AND worker_id = %s AND start_date <= %s AND end_date >= %s
+        ORDER BY start_date, start_time NULLS FIRST
+        """,
+        (salon_id, worker_id, appointment_date, appointment_date),
+        cursor=cursor,
+    )
+    for row in rows:
+        if row["all_day"] or row.get("start_time") is None or row.get("end_time") is None:
+            return row
+        off_start = time_to_minutes(row["start_time"])
+        off_end = time_to_minutes(row["end_time"])
+        if intervals_overlap(start_minutes, end_minutes, off_start, off_end):
+            return row
+    return None
+
+
+def appointment_availability_error(
+    salon,
+    worker_id,
+    appointment_date,
+    appointment_time,
+    duration_minutes,
+    exclude_id=None,
+    public_request=False,
+    cursor=None,
+    worker=None,
+):
+    selected_date = parse_iso_date(appointment_date)
+    start_minutes = time_to_minutes(appointment_time)
+    try:
+        duration_minutes = int(duration_minutes)
+    except (TypeError, ValueError):
+        duration_minutes = 0
+
+    if not selected_date or start_minutes is None or duration_minutes <= 0:
+        return "Datum, vreme ili trajanje termina nisu ispravni."
+    if start_minutes % BOOKING_SLOT_MINUTES != 0:
+        return "Termin mora poceti na punih 10 minuta."
+
+    open_minutes = time_to_minutes(salon.get("open_time"))
+    close_minutes = time_to_minutes(salon.get("close_time"))
+    end_minutes = start_minutes + duration_minutes
+    if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+        return "Radno vreme salona nije pravilno podeseno."
+    if start_minutes < open_minutes or end_minutes > close_minutes:
+        return "Izabrana usluga ne staje u radno vreme salona."
+
+    if public_request:
+        now = local_now()
+        if selected_date < now.date():
+            return "Izaberite danasnji ili buduci datum."
+        if selected_date == now.date() and start_minutes <= now.hour * 60 + now.minute:
+            return "Izabrano vreme je vec proslo."
+
+    if worker is None:
+        worker = query_rows(
+            "SELECT * FROM workers WHERE id = %s AND salon_id = %s",
+            (worker_id, salon["id"]),
+            one=True,
+            cursor=cursor,
+        )
+    if not worker:
+        return "Izabrani radnik ne postoji."
+    if not worker["active"]:
+        return "Izabrani radnik trenutno nije dostupan za zakazivanje."
+
+    time_off = worker_time_off_conflict(
+        salon["id"],
+        worker_id,
+        selected_date,
+        appointment_time,
+        duration_minutes,
+        cursor=cursor,
+    )
+    if time_off:
+        return "Radnik ne radi u izabranom periodu."
+
+    conflict = appointment_conflict(
+        salon["id"],
+        worker_id,
+        selected_date,
+        appointment_time,
+        duration_minutes,
+        exclude_id=exclude_id,
+        cursor=cursor,
+    )
+    if conflict:
+        return f"Radnik vec ima aktivan termin za klijenta {conflict['client_name']} u tom periodu."
+    return None
+
+
+def available_slots_for_worker(salon, worker_id, service_id, appointment_date):
+    selected_date = parse_iso_date(appointment_date)
+    if not selected_date:
+        return None, "Datum nije ispravan."
+    if selected_date < local_today():
+        return None, "Izaberite danasnji ili buduci datum."
+
+    assignment = worker_service_assignment(salon["id"], worker_id, service_id, active_only=True)
+    if not assignment:
+        return None, "Izabrani radnik ne pruza ovu uslugu."
+
+    duration_minutes = int(assignment["worker_duration_minutes"] or 0)
+    open_minutes = time_to_minutes(salon["open_time"])
+    close_minutes = time_to_minutes(salon["close_time"])
+    if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+        return None, "Radno vreme salona nije pravilno podeseno."
+
+    appointments = db_query(
+        """
+        SELECT a.time, a.duration_minutes
+        FROM appointments a
+        WHERE a.salon_id = %s AND a.worker_id = %s AND a.date = %s
+          AND a.status IN ('pending', 'scheduled')
+        """,
+        (salon["id"], worker_id, selected_date),
+    )
+    absences = db_query(
+        """
+        SELECT * FROM worker_time_off
+        WHERE salon_id = %s AND worker_id = %s AND start_date <= %s AND end_date >= %s
+        """,
+        (salon["id"], worker_id, selected_date, selected_date),
+    )
+
+    appointment_ranges = []
+    for row in appointments:
+        row_start = time_to_minutes(row["time"])
+        appointment_ranges.append((row_start, row_start + int(row.get("duration_minutes") or 30)))
+
+    absence_ranges = []
+    all_day_absence = False
+    for row in absences:
+        if row["all_day"] or row.get("start_time") is None or row.get("end_time") is None:
+            all_day_absence = True
+            break
+        absence_ranges.append((time_to_minutes(row["start_time"]), time_to_minutes(row["end_time"])))
+
+    slots = []
+    if not all_day_absence:
+        first_slot = ((open_minutes + BOOKING_SLOT_MINUTES - 1) // BOOKING_SLOT_MINUTES) * BOOKING_SLOT_MINUTES
+        now = local_now()
+        current_minutes = now.hour * 60 + now.minute if selected_date == now.date() else None
+        for start_minutes in range(first_slot, close_minutes - duration_minutes + 1, BOOKING_SLOT_MINUTES):
+            end_minutes = start_minutes + duration_minutes
+            if current_minutes is not None and start_minutes <= current_minutes:
+                continue
+            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in appointment_ranges):
+                continue
+            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in absence_ranges):
+                continue
+            slots.append(minutes_to_time(start_minutes))
+
+    return {
+        "slots": slots,
+        "price": float(assignment["worker_price"] or 0),
+        "duration_minutes": duration_minutes,
+        "worker_name": assignment["worker_name"],
+        "service_name": assignment["service_name"],
+    }, None
+
+
+def persist_appointment_locked(
+    salon,
+    client_id,
+    service_id,
+    worker_id,
+    appointment_date,
+    appointment_time,
+    duration_minutes,
+    price,
+    status,
+    source,
+    notes,
+    appointment_id=None,
+    public_request=False,
+):
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM workers WHERE id = %s AND salon_id = %s FOR UPDATE",
+                (worker_id, salon["id"]),
+            )
+            worker = cur.fetchone()
+            if not worker:
+                connection.rollback()
+                return None, "Izabrani radnik ne postoji."
+
+            assignment = worker_service_assignment(
+                salon["id"],
+                worker_id,
+                service_id,
+                active_only=status in ("pending", "scheduled"),
+                cursor=cur,
+            )
+            if not assignment:
+                connection.rollback()
+                return None, "Izabrani radnik ne pruza ovu uslugu."
+
+            if status in ("pending", "scheduled"):
+                error = appointment_availability_error(
+                    salon,
+                    worker_id,
+                    appointment_date,
+                    appointment_time,
+                    duration_minutes,
+                    exclude_id=appointment_id,
+                    public_request=public_request,
+                    cursor=cur,
+                    worker=worker,
+                )
+                if error:
+                    connection.rollback()
+                    return None, error
+
+            now = datetime.now()
+            if appointment_id:
+                cur.execute(
+                    """
+                    UPDATE appointments
+                    SET client_id = %s, service_id = %s, worker_id = %s, date = %s, time = %s,
+                        duration_minutes = %s, price = %s, status = %s, notes = %s, updated_at = %s
+                    WHERE id = %s AND salon_id = %s
+                    RETURNING id
+                    """,
+                    (
+                        client_id,
+                        service_id,
+                        worker_id,
+                        appointment_date,
+                        appointment_time,
+                        duration_minutes,
+                        price,
+                        status,
+                        notes,
+                        now,
+                        appointment_id,
+                        salon["id"],
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO appointments
+                        (salon_id, client_id, service_id, worker_id, date, time, duration_minutes,
+                         price, status, source, notes, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        salon["id"],
+                        client_id,
+                        service_id,
+                        worker_id,
+                        appointment_date,
+                        appointment_time,
+                        duration_minutes,
+                        price,
+                        status,
+                        source,
+                        notes,
+                        now,
+                        now,
+                    ),
+                )
+            row = cur.fetchone()
+        connection.commit()
+        if not row:
+            return None, "Termin nije pronadjen."
+        return row["id"], None
+    except Exception:
+        connection.rollback()
+        raise
 
 
 @app.route("/")
@@ -602,7 +1135,7 @@ def register():
             return render_template("register.html")
 
         slug = unique_slug(salon_name)
-        trial_ends_at = date.today() + timedelta(days=TRIAL_DAYS)
+        trial_ends_at = local_today() + timedelta(days=TRIAL_DAYS)
         salon_row = db_execute(
             """
             INSERT INTO salons
@@ -641,6 +1174,7 @@ def register():
             returning=True,
         )
         create_default_services(salon_id)
+        ensure_salon_default_worker(salon_id)
         if creator_is_super_admin:
             flash("Salon je kreiran i ostajete prijavljeni kao super admin.", "success")
             return redirect(url_for("super_admin_salon_detail", salon_id=salon_id))
@@ -666,7 +1200,7 @@ def logout():
 def dashboard():
     salon = current_salon()
     salon_id = salon["id"]
-    today = date.today()
+    today = local_today()
     today_str = today.isoformat()
     month_start = today.replace(day=1).isoformat()
 
@@ -707,13 +1241,20 @@ def dashboard():
     )["total"]
 
     client_count = db_query("SELECT COUNT(*) AS total FROM clients WHERE salon_id = %s", (salon_id,), one=True)["total"]
+    worker_count = db_query(
+        "SELECT COUNT(*) AS total FROM workers WHERE salon_id = %s AND active = TRUE",
+        (salon_id,),
+        one=True,
+    )["total"]
 
     upcoming = db_query(
         """
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name
+        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+               w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
         WHERE a.salon_id = %s AND a.date >= %s AND a.status IN ('pending', 'scheduled')
         ORDER BY a.date ASC, a.time ASC
         LIMIT 8
@@ -761,6 +1302,7 @@ def dashboard():
         "month_revenue": month_revenue,
         "pending_count": pending_count,
         "client_count": client_count,
+        "worker_count": worker_count,
     }
     return render_template(
         "dashboard.html",
@@ -779,6 +1321,7 @@ def appointments():
     status = request.args.get("status", "").strip()
     date_filter = request.args.get("date", "").strip()
     search = request.args.get("q", "").strip()
+    worker_filter = request.args.get("worker_id", "").strip()
 
     params = [salon_id]
     where = ["a.salon_id = %s"]
@@ -788,23 +1331,71 @@ def appointments():
     if date_filter:
         where.append("a.date = %s")
         params.append(date_filter)
+    if worker_filter:
+        where.append("a.worker_id = %s")
+        params.append(worker_filter)
     if search:
-        where.append("(LOWER(c.name) LIKE LOWER(%s) OR c.phone LIKE %s OR LOWER(s.name) LIKE LOWER(%s))")
+        where.append(
+            "(LOWER(c.name) LIKE LOWER(%s) OR c.phone LIKE %s OR LOWER(s.name) LIKE LOWER(%s) "
+            "OR LOWER(COALESCE(w.name, '')) LIKE LOWER(%s))"
+        )
         pattern = f"%{search}%"
-        params.extend([pattern, pattern, pattern])
+        params.extend([pattern, pattern, pattern, pattern])
 
     rows = db_query(
         f"""
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name
+        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+               w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
         WHERE {' AND '.join(where)}
         ORDER BY a.date ASC, a.time ASC
         """,
         params,
     )
-    return render_template("appointments.html", appointments=rows, filters={"status": status, "date": date_filter, "q": search})
+    workers = db_query(
+        "SELECT id, name, active FROM workers WHERE salon_id = %s ORDER BY active DESC, name",
+        (salon_id,),
+    )
+    return render_template(
+        "appointments.html",
+        appointments=rows,
+        workers=workers,
+        filters={"status": status, "date": date_filter, "q": search, "worker_id": worker_filter},
+    )
+
+
+def appointment_form_context(salon_id):
+    services = db_query(
+        "SELECT * FROM services WHERE salon_id = %s ORDER BY active DESC, name",
+        (salon_id,),
+    )
+    assignments = db_query(
+        """
+        SELECT ws.service_id, ws.worker_id, ws.price, ws.duration_minutes, ws.active AS assignment_active,
+               w.name AS worker_name, w.active AS worker_active
+        FROM worker_services ws
+        JOIN workers w ON w.id = ws.worker_id
+        JOIN services s ON s.id = ws.service_id
+        WHERE w.salon_id = %s AND s.salon_id = %s
+        ORDER BY w.active DESC, w.name, s.name
+        """,
+        (salon_id, salon_id),
+    )
+    worker_service_data = {}
+    for row in assignments:
+        worker_service_data.setdefault(str(row["service_id"]), []).append(
+            {
+                "worker_id": row["worker_id"],
+                "worker_name": row["worker_name"],
+                "price": float(row["price"] or 0),
+                "duration_minutes": int(row["duration_minutes"] or 30),
+                "active": bool(row["assignment_active"] and row["worker_active"]),
+            }
+        )
+    return services, worker_service_data
 
 
 @app.route("/appointments/new", methods=["GET", "POST"])
@@ -812,13 +1403,21 @@ def appointments():
 @subscription_required
 def appointment_new():
     salon_id = current_salon()["id"]
-    services = db_query("SELECT * FROM services WHERE salon_id = %s AND active = TRUE ORDER BY name", (salon_id,))
+    appointment = {}
     if request.method == "POST":
         result = save_appointment()
         if result:
             flash("Termin je dodat.", "success")
             return redirect(url_for("appointments"))
-    return render_template("appointment_form.html", appointment={}, services=services, mode="new")
+        appointment = dict(request.form)
+    services, worker_service_data = appointment_form_context(salon_id)
+    return render_template(
+        "appointment_form.html",
+        appointment=appointment,
+        services=services,
+        worker_service_data=worker_service_data,
+        mode="new",
+    )
 
 
 @app.route("/appointments/<int:appointment_id>/edit", methods=["GET", "POST"])
@@ -828,10 +1427,12 @@ def appointment_edit(appointment_id):
     salon_id = current_salon()["id"]
     appointment = db_query(
         """
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, c.email AS client_email, s.name AS service_name
+        SELECT a.*, c.name AS client_name, c.phone AS client_phone, c.email AS client_email,
+               s.name AS service_name, w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
         WHERE a.id = %s AND a.salon_id = %s
         """,
         (appointment_id, salon_id),
@@ -841,77 +1442,118 @@ def appointment_edit(appointment_id):
         flash("Termin nije pronadjen.", "error")
         return redirect(url_for("appointments"))
 
-    services = db_query("SELECT * FROM services WHERE salon_id = %s ORDER BY active DESC, name", (salon_id,))
+    appointment_data = dict(appointment)
     if request.method == "POST":
         result = save_appointment(appointment_id)
         if result:
             flash("Termin je sacuvan.", "success")
             return redirect(url_for("appointments"))
+        appointment_data.update(dict(request.form))
 
-    return render_template("appointment_form.html", appointment=dict(appointment), services=services, mode="edit")
+    services, worker_service_data = appointment_form_context(salon_id)
+    return render_template(
+        "appointment_form.html",
+        appointment=appointment_data,
+        services=services,
+        worker_service_data=worker_service_data,
+        mode="edit",
+    )
 
 
 def save_appointment(appointment_id=None):
-    salon_id = current_salon()["id"]
+    salon = current_salon()
+    salon_id = salon["id"]
     client_name = request.form.get("client_name", "").strip()
     client_phone = request.form.get("client_phone", "").strip()
     service_id = request.form.get("service_id", "").strip()
+    worker_id = request.form.get("worker_id", "").strip()
     appointment_date = request.form.get("date", "").strip()
     appointment_time = request.form.get("time", "").strip()
     status = request.form.get("status", "scheduled").strip()
     notes = request.form.get("notes", "").strip()
 
-    if not client_name or not service_id or not appointment_date or not appointment_time:
-        flash("Popunite ime klijenta, uslugu, datum i vreme.", "error")
+    if not client_name or not service_id or not worker_id or not appointment_date or not appointment_time:
+        flash("Popunite ime klijenta, uslugu, radnika, datum i vreme.", "error")
+        return False
+    if status not in STATUS_LABELS:
+        flash("Status termina nije ispravan.", "error")
         return False
 
-    service = db_query("SELECT * FROM services WHERE id = %s AND salon_id = %s", (service_id, salon_id), one=True)
-    if not service:
-        flash("Izabrana usluga ne postoji.", "error")
+    assignment = worker_service_assignment(
+        salon_id,
+        worker_id,
+        service_id,
+        active_only=status in ("pending", "scheduled"),
+    )
+    if not assignment:
+        flash("Izabrani radnik ne pruza ovu uslugu.", "error")
         return False
 
-    conflict = exact_time_conflict(salon_id, appointment_date, appointment_time, appointment_id)
-    if conflict and status in ("pending", "scheduled"):
-        flash(f"Vec postoji aktivan termin u {appointment_time} za {conflict['client_name']}.", "error")
-        return False
-
-    price = parse_price(request.form.get("price"), fallback=service["price"])
+    duration_minutes = int(assignment["worker_duration_minutes"] or 30)
+    price = max(0.0, parse_price(request.form.get("price"), fallback=assignment["worker_price"]))
     client_id = get_or_create_client(salon_id, client_name, client_phone)
-    now = datetime.now()
-
-    if appointment_id:
-        db_execute(
-            """
-            UPDATE appointments
-            SET client_id = %s, service_id = %s, date = %s, time = %s, price = %s, status = %s, notes = %s, updated_at = %s
-            WHERE id = %s AND salon_id = %s
-            """,
-            (client_id, service_id, appointment_date, appointment_time, price, status, notes, now, appointment_id, salon_id),
-        )
-    else:
-        db_execute(
-            """
-            INSERT INTO appointments (salon_id, client_id, service_id, date, time, price, status, source, notes, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'admin', %s, %s, %s)
-            """,
-            (salon_id, client_id, service_id, appointment_date, appointment_time, price, status, notes, now, now),
-        )
-    return True
+    saved_id, error = persist_appointment_locked(
+        salon,
+        client_id,
+        int(service_id),
+        int(worker_id),
+        appointment_date,
+        appointment_time,
+        duration_minutes,
+        price,
+        status,
+        "admin",
+        notes,
+        appointment_id=appointment_id,
+    )
+    if error:
+        flash(error, "error")
+        return False
+    return bool(saved_id)
 
 
 @app.route("/appointments/<int:appointment_id>/status", methods=["POST"])
 @salon_required
 @subscription_required
 def appointment_status(appointment_id):
-    salon_id = current_salon()["id"]
+    salon = current_salon()
+    salon_id = salon["id"]
     new_status = request.form.get("status", "").strip()
     if new_status not in STATUS_LABELS:
         flash("Nepoznat status.", "error")
         return redirect(request.referrer or url_for("appointments"))
-    db_execute(
-        "UPDATE appointments SET status = %s, updated_at = %s WHERE id = %s AND salon_id = %s",
-        (new_status, datetime.now(), appointment_id, salon_id),
+    appointment = db_query(
+        "SELECT * FROM appointments WHERE id = %s AND salon_id = %s",
+        (appointment_id, salon_id),
+        one=True,
     )
+    if not appointment:
+        flash("Termin nije pronadjen.", "error")
+        return redirect(request.referrer or url_for("appointments"))
+
+    if new_status in ("pending", "scheduled"):
+        _, error = persist_appointment_locked(
+            salon,
+            appointment["client_id"],
+            appointment["service_id"],
+            appointment["worker_id"],
+            appointment["date"],
+            appointment["time"],
+            appointment["duration_minutes"],
+            appointment["price"],
+            new_status,
+            appointment["source"],
+            appointment.get("notes") or "",
+            appointment_id=appointment_id,
+        )
+        if error:
+            flash(error, "error")
+            return redirect(request.referrer or url_for("appointments"))
+    else:
+        db_execute(
+            "UPDATE appointments SET status = %s, updated_at = %s WHERE id = %s AND salon_id = %s",
+            (new_status, datetime.now(), appointment_id, salon_id),
+        )
     flash("Status termina je promenjen.", "success")
     return redirect(request.referrer or url_for("appointments"))
 
@@ -955,6 +1597,361 @@ def clients():
     return render_template("clients.html", clients=rows, search=search)
 
 
+@app.route("/workers")
+@salon_required
+@subscription_required
+def workers():
+    salon_id = current_salon()["id"]
+    rows = db_query(
+        """
+        SELECT w.*,
+               (SELECT COUNT(*)
+                FROM worker_services ws
+                JOIN services s ON s.id = ws.service_id
+                WHERE ws.worker_id = w.id AND ws.active = TRUE AND s.active = TRUE) AS service_count,
+               (SELECT STRING_AGG(s.name, ', ' ORDER BY s.name)
+                FROM worker_services ws
+                JOIN services s ON s.id = ws.service_id
+                WHERE ws.worker_id = w.id AND ws.active = TRUE AND s.active = TRUE) AS service_names,
+               (SELECT COUNT(*)
+                FROM appointments a
+                WHERE a.worker_id = w.id AND a.date >= %s AND a.status IN ('pending', 'scheduled')) AS upcoming_count
+        FROM workers w
+        WHERE w.salon_id = %s
+        ORDER BY w.active DESC, w.name
+        """,
+        (local_today(), salon_id),
+    )
+    return render_template("workers.html", workers=rows)
+
+
+@app.route("/workers/new", methods=["GET", "POST"])
+@salon_required
+@subscription_required
+def worker_new():
+    salon_id = current_salon()["id"]
+    worker = {}
+    if request.method == "POST":
+        worker_id = save_worker()
+        if worker_id:
+            flash("Radnik je dodat.", "success")
+            return redirect(url_for("workers"))
+        worker = dict(request.form)
+    services_rows = db_query("SELECT * FROM services WHERE salon_id = %s ORDER BY active DESC, name", (salon_id,))
+    return render_template(
+        "worker_form.html",
+        worker=worker,
+        services=services_rows,
+        assignments={},
+        mode="new",
+    )
+
+
+@app.route("/workers/<int:worker_id>/edit", methods=["GET", "POST"])
+@salon_required
+@subscription_required
+def worker_edit(worker_id):
+    salon_id = current_salon()["id"]
+    worker = db_query("SELECT * FROM workers WHERE id = %s AND salon_id = %s", (worker_id, salon_id), one=True)
+    if not worker:
+        flash("Radnik nije pronadjen.", "error")
+        return redirect(url_for("workers"))
+
+    worker_data = dict(worker)
+    if request.method == "POST":
+        saved_id = save_worker(worker_id)
+        if saved_id:
+            flash("Podaci radnika su sacuvani.", "success")
+            return redirect(url_for("workers"))
+        worker_data.update(dict(request.form))
+
+    services_rows = db_query("SELECT * FROM services WHERE salon_id = %s ORDER BY active DESC, name", (salon_id,))
+    assignment_rows = db_query("SELECT * FROM worker_services WHERE worker_id = %s", (worker_id,))
+    assignments = {row["service_id"]: row for row in assignment_rows}
+    return render_template(
+        "worker_form.html",
+        worker=worker_data,
+        services=services_rows,
+        assignments=assignments,
+        mode="edit",
+    )
+
+
+def save_worker(worker_id=None):
+    salon_id = current_salon()["id"]
+    name = request.form.get("name", "").strip()
+    phone = request.form.get("phone", "").strip()
+    email = request.form.get("email", "").strip()
+    notes = request.form.get("notes", "").strip()
+    active = request.form.get("active") == "on"
+    if not name:
+        flash("Ime radnika je obavezno.", "error")
+        return None
+
+    service_rows = db_query("SELECT * FROM services WHERE salon_id = %s ORDER BY id", (salon_id,))
+    now = datetime.now()
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            if worker_id:
+                cur.execute(
+                    """
+                    UPDATE workers
+                    SET name = %s, phone = %s, email = %s, notes = %s, active = %s, updated_at = %s
+                    WHERE id = %s AND salon_id = %s
+                    RETURNING id
+                    """,
+                    (name, phone, email, notes, active, now, worker_id, salon_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO workers (salon_id, name, phone, email, notes, active, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (salon_id, name, phone, email, notes, active, now, now),
+                )
+            worker_row = cur.fetchone()
+            if not worker_row:
+                connection.rollback()
+                flash("Radnik nije pronadjen.", "error")
+                return None
+            worker_id = worker_row["id"]
+
+            for service in service_rows:
+                selected = request.form.get(f"service_{service['id']}") == "on"
+                price = max(0.0, parse_price(request.form.get(f"price_{service['id']}"), fallback=service["price"]))
+                try:
+                    duration = int(request.form.get(f"duration_{service['id']}") or service["duration_minutes"])
+                except (TypeError, ValueError):
+                    duration = int(service["duration_minutes"] or 30)
+                duration = max(BOOKING_SLOT_MINUTES, duration)
+                if selected:
+                    cur.execute(
+                        """
+                        INSERT INTO worker_services
+                            (worker_id, service_id, price, duration_minutes, active, created_at, updated_at)
+                        VALUES (%s, %s, %s, %s, TRUE, %s, %s)
+                        ON CONFLICT (worker_id, service_id)
+                        DO UPDATE SET price = EXCLUDED.price,
+                                      duration_minutes = EXCLUDED.duration_minutes,
+                                      active = TRUE,
+                                      updated_at = EXCLUDED.updated_at
+                        """,
+                        (worker_id, service["id"], price, duration, now, now),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE worker_services
+                        SET active = FALSE, updated_at = %s
+                        WHERE worker_id = %s AND service_id = %s
+                        """,
+                        (now, worker_id, service["id"]),
+                    )
+        connection.commit()
+        return worker_id
+    except Exception:
+        connection.rollback()
+        raise
+
+
+@app.route("/workers/<int:worker_id>/toggle", methods=["POST"])
+@salon_required
+@subscription_required
+def worker_toggle(worker_id):
+    salon_id = current_salon()["id"]
+    worker = db_query("SELECT * FROM workers WHERE id = %s AND salon_id = %s", (worker_id, salon_id), one=True)
+    if worker:
+        db_execute(
+            "UPDATE workers SET active = %s, updated_at = %s WHERE id = %s AND salon_id = %s",
+            (not worker["active"], datetime.now(), worker_id, salon_id),
+        )
+        flash("Status radnika je promenjen.", "success")
+    return redirect(url_for("workers"))
+
+
+@app.route("/workers/<int:worker_id>/delete", methods=["POST"])
+@salon_required
+@subscription_required
+def worker_delete(worker_id):
+    salon_id = current_salon()["id"]
+    used = db_query(
+        "SELECT COUNT(*) AS total FROM appointments WHERE worker_id = %s AND salon_id = %s",
+        (worker_id, salon_id),
+        one=True,
+    )["total"]
+    worker_count = db_query(
+        "SELECT COUNT(*) AS total FROM workers WHERE salon_id = %s",
+        (salon_id,),
+        one=True,
+    )["total"]
+    if used:
+        flash("Radnik ima termine i ne moze se obrisati. Mozete ga deaktivirati.", "warning")
+    elif worker_count <= 1:
+        flash("Salon mora imati bar jednog radnika.", "warning")
+    else:
+        db_execute("DELETE FROM workers WHERE id = %s AND salon_id = %s", (worker_id, salon_id))
+        flash("Radnik je obrisan.", "info")
+    return redirect(url_for("workers"))
+
+
+def parse_calendar_month(value):
+    try:
+        parsed = datetime.strptime(value, "%Y-%m").date()
+        return parsed.replace(day=1)
+    except (TypeError, ValueError):
+        return local_today().replace(day=1)
+
+
+@app.route("/calendar", methods=["GET", "POST"])
+@salon_required
+@subscription_required
+def worker_calendar():
+    salon_id = current_salon()["id"]
+    if request.method == "POST":
+        worker_id = request.form.get("worker_id", "").strip()
+        start_date = parse_iso_date(request.form.get("start_date", "").strip())
+        end_date = parse_iso_date(request.form.get("end_date", "").strip()) or start_date
+        all_day = request.form.get("all_day") == "on"
+        start_time = request.form.get("start_time", "").strip() or None
+        end_time = request.form.get("end_time", "").strip() or None
+        reason = request.form.get("reason", "").strip()
+        worker = db_query(
+            "SELECT * FROM workers WHERE id = %s AND salon_id = %s",
+            (worker_id, salon_id),
+            one=True,
+        )
+        if not worker or not start_date or not end_date or end_date < start_date:
+            flash("Izaberite radnika i ispravan datum odsustva.", "error")
+        elif (end_date - start_date).days > 366:
+            flash("Odsustvo ne moze biti duze od godinu dana.", "error")
+        elif not all_day and (
+            start_date != end_date
+            or time_to_minutes(start_time) is None
+            or time_to_minutes(end_time) is None
+            or time_to_minutes(end_time) <= time_to_minutes(start_time)
+        ):
+            flash("Delimicno odsustvo mora biti za jedan dan i imati ispravno vreme.", "error")
+        else:
+            connection = get_db()
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM workers WHERE id = %s AND salon_id = %s FOR UPDATE",
+                        (worker_id, salon_id),
+                    )
+                    if not cur.fetchone():
+                        connection.rollback()
+                        flash("Radnik nije pronadjen.", "error")
+                        return redirect(url_for("worker_calendar"))
+                    cur.execute(
+                        """
+                        INSERT INTO worker_time_off
+                            (salon_id, worker_id, start_date, end_date, start_time, end_time, all_day, reason)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            salon_id,
+                            worker_id,
+                            start_date,
+                            end_date,
+                            None if all_day else start_time,
+                            None if all_day else end_time,
+                            all_day,
+                            reason,
+                        ),
+                    )
+                connection.commit()
+                flash("Odsustvo je dodato u kalendar.", "success")
+            except Exception:
+                connection.rollback()
+                raise
+        month_value = start_date.strftime("%Y-%m") if start_date else local_today().strftime("%Y-%m")
+        return redirect(url_for("worker_calendar", month=month_value, worker_id=worker_id))
+
+    month_start = parse_calendar_month(request.args.get("month"))
+    if month_start.month == 12:
+        next_month_start = date(month_start.year + 1, 1, 1)
+    else:
+        next_month_start = date(month_start.year, month_start.month + 1, 1)
+    month_end = next_month_start - timedelta(days=1)
+    previous_month_start = (month_start - timedelta(days=1)).replace(day=1)
+    worker_filter = request.args.get("worker_id", "").strip()
+
+    workers_rows = db_query(
+        "SELECT * FROM workers WHERE salon_id = %s ORDER BY active DESC, name",
+        (salon_id,),
+    )
+    params = [salon_id, month_end, month_start]
+    worker_where = ""
+    if worker_filter:
+        worker_where = " AND o.worker_id = %s"
+        params.append(worker_filter)
+    absence_rows = db_query(
+        f"""
+        SELECT o.*, w.name AS worker_name
+        FROM worker_time_off o
+        JOIN workers w ON w.id = o.worker_id
+        WHERE o.salon_id = %s AND o.start_date <= %s AND o.end_date >= %s {worker_where}
+        ORDER BY o.start_date, w.name
+        """,
+        params,
+    )
+    absence_by_date = {}
+    for absence in absence_rows:
+        current = max(absence["start_date"], month_start)
+        final = min(absence["end_date"], month_end)
+        while current <= final:
+            absence_by_date.setdefault(current.isoformat(), []).append(absence)
+            current += timedelta(days=1)
+
+    calendar_weeks = []
+    for week in calendar_module.Calendar(firstweekday=0).monthdatescalendar(month_start.year, month_start.month):
+        calendar_weeks.append(
+            [
+                {
+                    "date": day,
+                    "iso": day.isoformat(),
+                    "in_month": day.month == month_start.month,
+                    "is_today": day == local_today(),
+                    "absences": absence_by_date.get(day.isoformat(), []),
+                }
+                for day in week
+            ]
+        )
+
+    return render_template(
+        "calendar.html",
+        workers=workers_rows,
+        calendar_weeks=calendar_weeks,
+        month_start=month_start,
+        previous_month=previous_month_start.strftime("%Y-%m"),
+        next_month=next_month_start.strftime("%Y-%m"),
+        worker_filter=worker_filter,
+        absences=absence_rows,
+    )
+
+
+@app.route("/calendar/time-off/<int:time_off_id>/delete", methods=["POST"])
+@salon_required
+@subscription_required
+def worker_time_off_delete(time_off_id):
+    salon_id = current_salon()["id"]
+    row = db_query(
+        "SELECT * FROM worker_time_off WHERE id = %s AND salon_id = %s",
+        (time_off_id, salon_id),
+        one=True,
+    )
+    if row:
+        db_execute("DELETE FROM worker_time_off WHERE id = %s AND salon_id = %s", (time_off_id, salon_id))
+        flash("Odsustvo je uklonjeno.", "info")
+        return redirect(url_for("worker_calendar", month=row["start_date"].strftime("%Y-%m"), worker_id=row["worker_id"]))
+    flash("Odsustvo nije pronadjeno.", "error")
+    return redirect(url_for("worker_calendar"))
+
+
 @app.route("/services")
 @salon_required
 @subscription_required
@@ -964,7 +1961,11 @@ def services():
         """
         SELECT s.*,
                COUNT(a.id) AS total_appointments,
-               COALESCE(SUM(CASE WHEN a.status = 'completed' THEN a.price ELSE 0 END), 0) AS revenue
+               COALESCE(SUM(CASE WHEN a.status = 'completed' THEN a.price ELSE 0 END), 0) AS revenue,
+               (SELECT COUNT(*)
+                FROM worker_services ws
+                JOIN workers w ON w.id = ws.worker_id
+                WHERE ws.service_id = s.id AND ws.active = TRUE AND w.active = TRUE) AS worker_count
         FROM services s
         LEFT JOIN appointments a ON a.service_id = s.id AND a.salon_id = s.salon_id
         WHERE s.salon_id = %s
@@ -1008,7 +2009,7 @@ def service_edit(service_id):
 def save_service(service_id=None):
     salon_id = current_salon()["id"]
     name = request.form.get("name", "").strip()
-    price = parse_price(request.form.get("price"), fallback=0)
+    price = max(0.0, parse_price(request.form.get("price"), fallback=0))
     duration = request.form.get("duration_minutes", "30").strip()
     description = request.form.get("description", "").strip()
     active = True if request.form.get("active") == "on" else False
@@ -1020,6 +2021,7 @@ def save_service(service_id=None):
         duration = int(duration)
     except ValueError:
         duration = 30
+    duration = max(BOOKING_SLOT_MINUTES, duration)
 
     try:
         if service_id:
@@ -1077,6 +2079,9 @@ def service_delete(service_id):
 def settings_page():
     salon_id = current_salon()["id"]
     if request.method == "POST":
+        booking_mode = request.form.get("booking_mode", "manual").strip()
+        if booking_mode not in ("manual", "automatic"):
+            booking_mode = "manual"
         value_map = {
             "name": request.form.get("business_name", "").strip(),
             "business_type": request.form.get("business_type", "").strip(),
@@ -1087,15 +2092,21 @@ def settings_page():
             "working_hours": request.form.get("working_hours", "").strip(),
             "open_time": request.form.get("open_time", "09:00").strip(),
             "close_time": request.form.get("close_time", "20:00").strip(),
-            "slot_minutes": int(request.form.get("slot_minutes", 30) or 30),
+            "slot_minutes": BOOKING_SLOT_MINUTES,
+            "booking_mode": booking_mode,
             "booking_note": request.form.get("booking_note", "").strip(),
         }
+        open_minutes = time_to_minutes(value_map["open_time"])
+        close_minutes = time_to_minutes(value_map["close_time"])
+        if not value_map["name"] or open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+            flash("Unesite naziv salona i ispravno vreme otvaranja i zatvaranja.", "error")
+            return render_template("settings.html")
         db_execute(
             """
             UPDATE salons
             SET name = %s, business_type = %s, phone = %s, whatsapp = %s, instagram = %s,
                 address = %s, working_hours = %s, open_time = %s, close_time = %s,
-                slot_minutes = %s, booking_note = %s, updated_at = %s
+                slot_minutes = %s, booking_mode = %s, booking_note = %s, updated_at = %s
             WHERE id = %s
             """,
             (
@@ -1109,6 +2120,7 @@ def settings_page():
                 value_map["open_time"],
                 value_map["close_time"],
                 value_map["slot_minutes"],
+                value_map["booking_mode"],
                 value_map["booking_note"],
                 datetime.now(),
                 salon_id,
@@ -1133,6 +2145,72 @@ def legacy_booking():
     return render_template("404.html"), 404
 
 
+def public_booking_context(salon, form_data=None):
+    salon_id = salon["id"]
+    services_rows = db_query(
+        """
+        SELECT s.id, s.name, s.description,
+               MIN(ws.price) AS min_price,
+               MIN(ws.duration_minutes) AS min_duration_minutes
+        FROM services s
+        JOIN worker_services ws ON ws.service_id = s.id AND ws.active = TRUE
+        JOIN workers w ON w.id = ws.worker_id AND w.active = TRUE
+        WHERE s.salon_id = %s AND s.active = TRUE
+        GROUP BY s.id
+        ORDER BY s.name
+        """,
+        (salon_id,),
+    )
+    assignment_rows = db_query(
+        """
+        SELECT ws.service_id, ws.worker_id, ws.price, ws.duration_minutes, w.name AS worker_name
+        FROM worker_services ws
+        JOIN workers w ON w.id = ws.worker_id
+        JOIN services s ON s.id = ws.service_id
+        WHERE w.salon_id = %s AND s.salon_id = %s
+          AND w.active = TRUE AND s.active = TRUE AND ws.active = TRUE
+        ORDER BY w.name
+        """,
+        (salon_id, salon_id),
+    )
+    booking_data = {}
+    for row in assignment_rows:
+        booking_data.setdefault(str(row["service_id"]), []).append(
+            {
+                "worker_id": row["worker_id"],
+                "worker_name": row["worker_name"],
+                "price": float(row["price"] or 0),
+                "duration_minutes": int(row["duration_minutes"] or 30),
+            }
+        )
+    return {
+        "services": services_rows,
+        "booking_data": booking_data,
+        "settings": salon_settings(salon),
+        "salon": salon,
+        "form_data": form_data or {},
+    }
+
+
+@app.route("/api/s/<slug>/availability")
+def public_availability(slug):
+    salon = db_query("SELECT * FROM salons WHERE slug = %s", (slug,), one=True)
+    if not salon or not subscription_is_allowed(salon):
+        return jsonify({"ok": False, "error": "Zakazivanje trenutno nije dostupno."}), 404
+    try:
+        service_id = int(request.args.get("service_id", ""))
+        worker_id = int(request.args.get("worker_id", ""))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Izaberite uslugu i radnika."}), 400
+    appointment_date = request.args.get("date", "").strip()
+    result, error = available_slots_for_worker(salon, worker_id, service_id, appointment_date)
+    if error:
+        return jsonify({"ok": False, "error": error, "slots": []}), 400
+    response = jsonify({"ok": True, **result})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/s/<slug>/zakazi", methods=["GET", "POST"])
 def public_booking(slug):
     salon = db_query("SELECT * FROM salons WHERE slug = %s", (slug,), one=True)
@@ -1142,52 +2220,54 @@ def public_booking(slug):
         return render_template("booking_unavailable.html", salon=salon, settings=salon_settings(salon)), 403
 
     salon_id = salon["id"]
-    services = db_query("SELECT * FROM services WHERE salon_id = %s AND active = TRUE ORDER BY name", (salon_id,))
-    settings = salon_settings(salon)
     if request.method == "POST":
         client_name = request.form.get("client_name", "").strip()
         client_phone = request.form.get("client_phone", "").strip()
         service_id = request.form.get("service_id", "").strip()
+        worker_id = request.form.get("worker_id", "").strip()
         appointment_date = request.form.get("date", "").strip()
         appointment_time = request.form.get("time", "").strip()
         notes = request.form.get("notes", "").strip()
-
-        if not client_name or not client_phone or not service_id or not appointment_date or not appointment_time:
-            flash("Popunite ime, telefon, uslugu, datum i vreme.", "error")
-            return render_template("booking.html", services=services, settings=settings, salon=salon)
+        form_data = dict(request.form)
 
         try:
-            selected_date = datetime.strptime(appointment_date, "%Y-%m-%d").date()
-        except ValueError:
-            selected_date = None
-        if not selected_date or selected_date < date.today():
-            flash("Izaberite danasnji ili buduci datum.", "error")
-            return render_template("booking.html", services=services, settings=settings, salon=salon)
+            service_id = int(service_id)
+            worker_id = int(worker_id)
+        except (TypeError, ValueError):
+            service_id = None
+            worker_id = None
 
-        service = db_query("SELECT * FROM services WHERE id = %s AND salon_id = %s AND active = TRUE", (service_id, salon_id), one=True)
-        if not service:
-            flash("Izabrana usluga trenutno nije dostupna.", "error")
-            return render_template("booking.html", services=services, settings=settings, salon=salon)
+        if not client_name or not client_phone or not service_id or not worker_id or not appointment_date or not appointment_time:
+            flash("Popunite ime, telefon, uslugu, radnika, datum i vreme.", "error")
+            return render_template("booking.html", **public_booking_context(salon, form_data))
 
-        conflict = exact_time_conflict(salon_id, appointment_date, appointment_time)
-        if conflict:
-            flash("Taj termin je vec zauzet. Izaberite drugo vreme.", "error")
-            return render_template("booking.html", services=services, settings=settings, salon=salon)
+        assignment = worker_service_assignment(salon_id, worker_id, service_id, active_only=True)
+        if not assignment:
+            flash("Izabrani radnik trenutno ne pruza ovu uslugu.", "error")
+            return render_template("booking.html", **public_booking_context(salon, form_data))
 
         client_id = get_or_create_client(salon_id, client_name, client_phone)
-        now = datetime.now()
-        appointment = db_execute(
-            """
-            INSERT INTO appointments (salon_id, client_id, service_id, date, time, price, status, source, notes, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, 'pending', 'public', %s, %s, %s)
-            RETURNING id
-            """,
-            (salon_id, client_id, service_id, appointment_date, appointment_time, service["price"], notes, now, now),
-            returning=True,
+        status = "scheduled" if salon.get("booking_mode") == "automatic" else "pending"
+        appointment_id, error = persist_appointment_locked(
+            salon,
+            client_id,
+            service_id,
+            worker_id,
+            appointment_date,
+            appointment_time,
+            int(assignment["worker_duration_minutes"] or 30),
+            assignment["worker_price"],
+            status,
+            "public",
+            notes,
+            public_request=True,
         )
-        return redirect(url_for("booking_success", slug=slug, appointment_id=appointment["id"]))
+        if error:
+            flash(error + " Osvezite listu i izaberite drugi termin.", "error")
+            return render_template("booking.html", **public_booking_context(salon, form_data))
+        return redirect(url_for("booking_success", slug=slug, appointment_id=appointment_id))
 
-    return render_template("booking.html", services=services, settings=settings, salon=salon)
+    return render_template("booking.html", **public_booking_context(salon))
 
 
 @app.route("/s/<slug>/zakazi/uspesno/<int:appointment_id>")
@@ -1197,10 +2277,11 @@ def booking_success(slug, appointment_id):
         return redirect(url_for("legacy_booking"))
     appointment = db_query(
         """
-        SELECT a.*, c.name AS client_name, s.name AS service_name
+        SELECT a.*, c.name AS client_name, s.name AS service_name, w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
         WHERE a.id = %s AND a.salon_id = %s
         """,
         (appointment_id, salon["id"]),
@@ -1218,10 +2299,12 @@ def export_appointments():
     salon_id = current_salon()["id"]
     rows = db_query(
         """
-        SELECT a.id, a.date, a.time, c.name AS client, c.phone, s.name AS service, a.price, a.status, a.source, a.notes
+        SELECT a.id, a.date, a.time, a.duration_minutes, c.name AS client, c.phone,
+               s.name AS service, w.name AS worker, a.price, a.status, a.source, a.notes
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
         WHERE a.salon_id = %s
         ORDER BY a.date DESC, a.time DESC
         """,
@@ -1229,7 +2312,7 @@ def export_appointments():
     )
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "date", "time", "client", "phone", "service", "price", "status", "source", "notes"])
+    writer.writerow(["id", "date", "time", "duration_minutes", "client", "phone", "service", "worker", "price", "status", "source", "notes"])
     for row in rows:
         writer.writerow([row[key] for key in row.keys()])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=appointments.csv"})

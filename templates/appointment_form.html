@@ -5,17 +5,17 @@
     <div>
         <span class="eyebrow">Termini</span>
         <h1>{% if mode == 'edit' %}Izmena termina{% else %}Novi termin{% endif %}</h1>
-        <p class="lead">Unesi klijenta, uslugu, datum, vreme i status.</p>
+        <p class="lead">Izaberi uslugu i radnika. Sistem proverava celo trajanje termina i odsustva radnika.</p>
     </div>
     <a class="btn btn-secondary" href="{{ url_for('appointments') }}">Nazad</a>
 </div>
 
 <section class="panel form-panel">
-    <form method="post" class="smart-form">
+    <form method="post" class="smart-form" id="appointmentForm" data-selected-worker="{{ appointment.get('worker_id', '') }}" data-mode="{{ mode }}">
         <div class="form-grid">
             <label>
                 Ime klijenta
-                <input type="text" name="client_name" value="{{ appointment.get('client_name', '') }}" placeholder="npr. Marko Petrovic" required>
+                <input type="text" name="client_name" value="{{ appointment.get('client_name', '') }}" placeholder="npr. Marko Petrović" required>
             </label>
             <label>
                 Telefon
@@ -26,10 +26,16 @@
                 <select name="service_id" id="serviceSelect" required>
                     <option value="">Izaberi uslugu</option>
                     {% for service in services %}
-                    <option value="{{ service.id }}" data-price="{{ service.price }}" {% if appointment.get('service_id') == service.id %}selected{% endif %}>
-                        {{ service.name }} - {{ service.price|money }}{% if not service.active %} (neaktivna){% endif %}
+                    <option value="{{ service.id }}" {% if appointment.get('service_id')|string == service.id|string %}selected{% endif %}>
+                        {{ service.name }}{% if not service.active %} (neaktivna){% endif %}
                     </option>
                     {% endfor %}
+                </select>
+            </label>
+            <label>
+                Radnik
+                <select name="worker_id" id="appointmentWorkerSelect" required>
+                    <option value="">Prvo izaberi uslugu</option>
                 </select>
             </label>
             <label>
@@ -37,12 +43,17 @@
                 <input type="text" name="price" id="priceInput" value="{{ appointment.get('price', '') }}" placeholder="npr. 1500">
             </label>
             <label>
+                Trajanje
+                <input type="text" id="appointmentDuration" value="-" readonly>
+            </label>
+            <label>
                 Datum
                 <input type="date" name="date" value="{{ appointment.get('date', today_iso) }}" required>
             </label>
             <label>
                 Vreme
-                <input type="time" name="time" value="{{ appointment.get('time', '10:00')|time_short }}" required>
+                <input type="time" name="time" step="600" value="{{ appointment.get('time', '10:00')|time_short }}" required>
+                <small class="field-help">Početak termina mora biti na svakih 10 minuta.</small>
             </label>
             <label>
                 Status
@@ -58,9 +69,10 @@
             </label>
         </div>
         <div class="form-actions">
-            <button class="btn btn-primary" type="submit">Sacuvaj termin</button>
+            <button class="btn btn-primary" type="submit">Sačuvaj termin</button>
             <a class="btn btn-ghost" href="{{ url_for('appointments') }}">Odustani</a>
         </div>
     </form>
 </section>
+<script id="workerServiceData" type="application/json">{{ worker_service_data|tojson }}</script>
 {% endblock %}

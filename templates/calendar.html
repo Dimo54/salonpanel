@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Kalendar radnika - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <span class="eyebrow">Dostupnost tima</span>
+        <h1>Kalendar</h1>
+        <p class="lead">Dodaj slobodan dan, odmor ili blokirano vreme. Ti periodi se odmah uklanjaju iz javnog zakazivanja.</p>
+    </div>
+    <a class="btn btn-secondary" href="{{ url_for('workers') }}">Radnici</a>
+</div>
+
+<div class="content-grid calendar-layout">
+    <section class="panel calendar-panel">
+        <div class="calendar-toolbar">
+            <div class="head-actions">
+                <a class="btn btn-mini btn-secondary" href="{{ url_for('worker_calendar', month=previous_month, worker_id=worker_filter) }}">← Prethodni</a>
+                <a class="btn btn-mini btn-ghost" href="{{ url_for('worker_calendar', worker_id=worker_filter) }}">Danas</a>
+                <a class="btn btn-mini btn-secondary" href="{{ url_for('worker_calendar', month=next_month, worker_id=worker_filter) }}">Sledeći →</a>
+            </div>
+            <h2>{{ month_start.strftime('%m.%Y') }}</h2>
+            <form method="get" class="calendar-filter">
+                <input type="hidden" name="month" value="{{ month_start.strftime('%Y-%m') }}">
+                <select name="worker_id" onchange="this.form.submit()">
+                    <option value="">Svi radnici</option>
+                    {% for worker in workers %}
+                    <option value="{{ worker.id }}" {% if worker_filter|string == worker.id|string %}selected{% endif %}>{{ worker.name }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+        </div>
+
+        <div class="calendar-grid calendar-weekdays">
+            <div>Pon</div><div>Uto</div><div>Sre</div><div>Čet</div><div>Pet</div><div>Sub</div><div>Ned</div>
+        </div>
+        <div class="calendar-grid calendar-days">
+            {% for week in calendar_weeks %}
+                {% for day in week %}
+                <button type="button" class="calendar-day {% if not day.in_month %}outside{% endif %} {% if day.is_today %}today{% endif %}" data-calendar-date="{{ day.iso }}">
+                    <span class="calendar-day-number">{{ day.date.day }}</span>
+                    <span class="calendar-day-events">
+                        {% for absence in day.absences[:3] %}
+                        <span class="calendar-event">
+                            <strong>{{ absence.worker_name }}</strong>
+                            <small>{% if absence.all_day %}Ne radi{% else %}{{ absence.start_time|time_short }}–{{ absence.end_time|time_short }}{% endif %}</small>
+                        </span>
+                        {% endfor %}
+                        {% if day.absences|length > 3 %}<span class="calendar-more">+{{ day.absences|length - 3 }} još</span>{% endif %}
+                    </span>
+                </button>
+                {% endfor %}
+            {% endfor %}
+        </div>
+        <p class="field-help calendar-help">Klik na datum automatski ga upisuje u formu za odsustvo.</p>
+    </section>
+
+    <aside class="panel calendar-form-panel">
+        <div class="panel-head">
+            <div>
+                <h2>Dodaj odsustvo</h2>
+                <p>Za ceo dan ili samo deo radnog vremena.</p>
+            </div>
+        </div>
+        <form method="post" class="form-stack" id="timeOffForm">
+            <label>
+                Radnik
+                <select name="worker_id" required>
+                    <option value="">Izaberi radnika</option>
+                    {% for worker in workers %}
+                    <option value="{{ worker.id }}" {% if worker_filter|string == worker.id|string %}selected{% endif %}>{{ worker.name }}{% if not worker.active %} (neaktivan){% endif %}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <div class="booking-row">
+                <label>
+                    Od datuma
+                    <input id="timeOffStartDate" type="date" name="start_date" min="{{ today_iso }}" value="{{ today_iso }}" required>
+                </label>
+                <label>
+                    Do datuma
+                    <input id="timeOffEndDate" type="date" name="end_date" min="{{ today_iso }}" value="{{ today_iso }}" required>
+                </label>
+            </div>
+            <label class="check-row">
+                <input id="allDayToggle" type="checkbox" name="all_day" checked>
+                Ne radi ceo dan
+            </label>
+            <div class="booking-row" id="partialTimeFields">
+                <label>
+                    Od
+                    <input type="time" name="start_time" step="600" value="09:00">
+                </label>
+                <label>
+                    Do
+                    <input type="time" name="end_time" step="600" value="12:00">
+                </label>
+            </div>
+            <label>
+                Razlog ili napomena
+                <input type="text" name="reason" placeholder="npr. godišnji odmor, privatne obaveze">
+            </label>
+            <button class="btn btn-primary full" type="submit">Dodaj u kalendar</button>
+        </form>
+
+        <div class="absence-list">
+            <h3>Odsustva ovog meseca</h3>
+            {% for absence in absences %}
+            <div class="absence-item">
+                <div>
+                    <strong>{{ absence.worker_name }}</strong>
+                    <span>
+                        {{ absence.start_date|date_sr }}{% if absence.end_date != absence.start_date %} – {{ absence.end_date|date_sr }}{% endif %}
+                        · {% if absence.all_day %}ceo dan{% else %}{{ absence.start_time|time_short }}–{{ absence.end_time|time_short }}{% endif %}
+                    </span>
+                    {% if absence.reason %}<small>{{ absence.reason }}</small>{% endif %}
+                </div>
+                <form method="post" action="{{ url_for('worker_time_off_delete', time_off_id=absence.id) }}" data-confirm="Ukloniti odsustvo?">
+                    <button class="btn btn-mini btn-ghost" type="submit">Ukloni</button>
+                </form>
+            </div>
+            {% else %}
+            <p class="field-help">Nema unetih odsustava za ovaj prikaz.</p>
+            {% endfor %}
+        </div>
+    </aside>
+</div>
+{% endblock %}

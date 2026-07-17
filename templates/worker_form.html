@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}{% if mode == 'edit' %}Izmena radnika{% else %}Novi radnik{% endif %} - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <span class="eyebrow">Tim i cenovnik</span>
+        <h1>{% if mode == 'edit' %}Izmena radnika{% else %}Novi radnik{% endif %}</h1>
+        <p class="lead">Označi usluge koje radnik radi, pa za svaku unesi njegovu cenu i trajanje.</p>
+    </div>
+    <a class="btn btn-secondary" href="{{ url_for('workers') }}">Nazad</a>
+</div>
+
+<form method="post" class="smart-form">
+    <section class="panel form-panel">
+        <div class="panel-head">
+            <div>
+                <h2>Podaci radnika</h2>
+                <p>Ime se prikazuje klijentu prilikom zakazivanja.</p>
+            </div>
+        </div>
+        <div class="form-grid">
+            <label>
+                Ime i prezime
+                <input type="text" name="name" value="{{ worker.get('name', '') }}" placeholder="npr. Ana Petrović" required>
+            </label>
+            <label>
+                Telefon
+                <input type="text" name="phone" value="{{ worker.get('phone', '') }}" placeholder="061...">
+            </label>
+            <label>
+                Email
+                <input type="email" name="email" value="{{ worker.get('email', '') }}" placeholder="ana@salon.rs">
+            </label>
+            <label class="check-row align-end">
+                <input type="checkbox" name="active" {% if (request.method == 'POST' and worker.get('active') == 'on') or (request.method != 'POST' and worker.get('active', true)) %}checked{% endif %}>
+                Aktivan radnik
+            </label>
+            <label class="span-two">
+                Napomena
+                <textarea name="notes" rows="3" placeholder="Interna napomena o radniku">{{ worker.get('notes', '') }}</textarea>
+            </label>
+        </div>
+    </section>
+
+    <section class="panel form-panel">
+        <div class="panel-head">
+            <div>
+                <h2>Usluge, cene i trajanje</h2>
+                <p>Klijent će moći da izabere samo usluge koje su označene za ovog radnika.</p>
+            </div>
+            <a href="{{ url_for('service_new') }}">+ Nova usluga</a>
+        </div>
+
+        <div class="assignment-list">
+            {% for service in services %}
+                {% set assignment = assignments.get(service.id) %}
+                {% set field_key = 'service_' ~ service.id %}
+                {% if request.method == 'POST' %}
+                    {% set selected = worker.get(field_key) == 'on' %}
+                {% else %}
+                    {% set selected = assignment and assignment.active %}
+                {% endif %}
+                {% set price_key = 'price_' ~ service.id %}
+                {% set duration_key = 'duration_' ~ service.id %}
+            <article class="assignment-row {% if not service.active %}muted-card{% endif %}">
+                <label class="assignment-check">
+                    <input class="service-assignment-checkbox" type="checkbox" name="service_{{ service.id }}" {% if selected %}checked{% endif %}>
+                    <span>
+                        <strong>{{ service.name }}</strong>
+                        <small>{{ service.description or 'Bez opisa' }}{% if not service.active %} · usluga je neaktivna{% endif %}</small>
+                    </span>
+                </label>
+                <label>
+                    Cena
+                    <input class="assignment-input" type="text" name="price_{{ service.id }}" value="{{ worker.get(price_key, assignment.price if assignment else service.price) }}" placeholder="{{ service.price }}">
+                </label>
+                <label>
+                    Trajanje
+                    <div class="input-suffix">
+                        <input class="assignment-input" type="number" name="duration_{{ service.id }}" min="10" step="5" value="{{ worker.get(duration_key, assignment.duration_minutes if assignment else service.duration_minutes) }}">
+                        <span>min</span>
+                    </div>
+                </label>
+            </article>
+            {% else %}
+            <p class="empty-cell">Prvo dodaj bar jednu uslugu.</p>
+            {% endfor %}
+        </div>
+    </section>
+
+    <div class="form-actions sticky-actions">
+        <button class="btn btn-primary" type="submit">Sačuvaj radnika</button>
+        <a class="btn btn-ghost" href="{{ url_for('workers') }}">Odustani</a>
+    </div>
+</form>
+{% endblock %}

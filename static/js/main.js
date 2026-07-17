@@ -8,15 +8,126 @@ document.addEventListener("DOMContentLoaded", function () {
         });
     });
 
-    var serviceSelect = document.getElementById("serviceSelect");
-    var priceInput = document.getElementById("priceInput");
-    if (serviceSelect && priceInput) {
-        serviceSelect.addEventListener("change", function () {
-            var option = serviceSelect.options[serviceSelect.selectedIndex];
-            var price = option ? option.getAttribute("data-price") : "";
-            if (price && !priceInput.value) {
-                priceInput.value = Math.round(Number(price));
+    document.querySelectorAll(".service-assignment-checkbox").forEach(function (checkbox) {
+        function syncAssignmentRow() {
+            var row = checkbox.closest(".assignment-row");
+            if (!row) {
+                return;
             }
+            row.classList.toggle("assignment-disabled", !checkbox.checked);
+            row.querySelectorAll(".assignment-input").forEach(function (input) {
+                input.disabled = !checkbox.checked;
+            });
+        }
+        checkbox.addEventListener("change", syncAssignmentRow);
+        syncAssignmentRow();
+    });
+
+    var appointmentForm = document.getElementById("appointmentForm");
+    var serviceSelect = document.getElementById("serviceSelect");
+    var workerSelect = document.getElementById("appointmentWorkerSelect");
+    var priceInput = document.getElementById("priceInput");
+    var durationInput = document.getElementById("appointmentDuration");
+    var workerDataNode = document.getElementById("workerServiceData");
+
+    if (appointmentForm && serviceSelect && workerSelect && workerDataNode) {
+        var workerServiceData = {};
+        try {
+            workerServiceData = JSON.parse(workerDataNode.textContent || "{}");
+        } catch (error) {
+            workerServiceData = {};
+        }
+        var selectedWorker = String(appointmentForm.dataset.selectedWorker || "");
+        var initialLoad = true;
+
+        function selectedAssignment() {
+            var rows = workerServiceData[String(serviceSelect.value)] || [];
+            return rows.find(function (row) {
+                return String(row.worker_id) === String(workerSelect.value);
+            }) || null;
+        }
+
+        function syncAppointmentPrice() {
+            var assignment = selectedAssignment();
+            if (!assignment) {
+                if (durationInput) {
+                    durationInput.value = "-";
+                }
+                return;
+            }
+            if (durationInput) {
+                durationInput.value = assignment.duration_minutes + " min";
+            }
+            if (priceInput && (!initialLoad || !priceInput.value)) {
+                priceInput.value = Math.round(Number(assignment.price || 0));
+            }
+        }
+
+        function populateAppointmentWorkers() {
+            var rows = workerServiceData[String(serviceSelect.value)] || [];
+            var wanted = selectedWorker || workerSelect.value;
+            workerSelect.innerHTML = "";
+            var placeholder = document.createElement("option");
+            placeholder.value = "";
+            placeholder.textContent = rows.length ? "Izaberi radnika" : "Nema radnika za ovu uslugu";
+            workerSelect.appendChild(placeholder);
+            rows.forEach(function (row) {
+                var option = document.createElement("option");
+                option.value = row.worker_id;
+                option.textContent = row.worker_name + " · " + Math.round(Number(row.price || 0)).toLocaleString("sr-RS") + " RSD · " + row.duration_minutes + " min" + (row.active ? "" : " (neaktivan)");
+                if (String(row.worker_id) === String(wanted)) {
+                    option.selected = true;
+                }
+                workerSelect.appendChild(option);
+            });
+            workerSelect.disabled = rows.length === 0;
+            if (!workerSelect.value && rows.length === 1) {
+                workerSelect.value = String(rows[0].worker_id);
+            }
+            selectedWorker = workerSelect.value;
+            syncAppointmentPrice();
+            initialLoad = false;
+        }
+
+        serviceSelect.addEventListener("change", function () {
+            selectedWorker = "";
+            initialLoad = false;
+            populateAppointmentWorkers();
         });
+        workerSelect.addEventListener("change", function () {
+            selectedWorker = workerSelect.value;
+            initialLoad = false;
+            syncAppointmentPrice();
+        });
+        populateAppointmentWorkers();
     }
+
+    var allDayToggle = document.getElementById("allDayToggle");
+    var partialTimeFields = document.getElementById("partialTimeFields");
+    if (allDayToggle && partialTimeFields) {
+        function syncTimeOffFields() {
+            partialTimeFields.classList.toggle("is-hidden", allDayToggle.checked);
+            partialTimeFields.querySelectorAll("input").forEach(function (input) {
+                input.disabled = allDayToggle.checked;
+            });
+        }
+        allDayToggle.addEventListener("change", syncTimeOffFields);
+        syncTimeOffFields();
+    }
+
+    var startDateInput = document.getElementById("timeOffStartDate");
+    var endDateInput = document.getElementById("timeOffEndDate");
+    document.querySelectorAll("[data-calendar-date]").forEach(function (dayButton) {
+        dayButton.addEventListener("click", function () {
+            if (startDateInput) {
+                startDateInput.value = dayButton.dataset.calendarDate;
+            }
+            if (endDateInput) {
+                endDateInput.value = dayButton.dataset.calendarDate;
+            }
+            document.querySelectorAll("[data-calendar-date]").forEach(function (node) {
+                node.classList.toggle("selected", node === dayButton);
+            });
+        });
+    });
 });

@@ -3,21 +3,27 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Zahtev poslat</title>
+    <title>{% if appointment.status == 'scheduled' %}Termin zakazan{% else %}Zahtev poslat{% endif %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
 <body class="booking-body">
     <main class="success-shell">
-        <section class="success-card">
+        <section class="success-card success-card-wide">
             <span class="success-icon">OK</span>
+            {% if appointment.status == 'scheduled' %}
+            <h1>Termin je zakazan</h1>
+            <p>Hvala, {{ appointment.client_name }}. Vaš termin je odmah potvrđen.</p>
+            {% else %}
             <h1>Zahtev je poslat</h1>
-            <p>Hvala, {{ appointment.client_name }}. Salon ce potvrditi termin porukom ili pozivom.</p>
-            <div class="success-details">
+            <p>Hvala, {{ appointment.client_name }}. Termin je sačuvan za vas dok salon ne potvrdi zahtev.</p>
+            {% endif %}
+            <div class="success-details success-details-four">
                 <div><span>Usluga</span><strong>{{ appointment.service_name }}</strong></div>
+                <div><span>Radnik</span><strong>{{ appointment.worker_name or '-' }}</strong></div>
                 <div><span>Datum</span><strong>{{ appointment.date|date_sr }}</strong></div>
-                <div><span>Vreme</span><strong>{{ appointment.time|time_short }}</strong></div>
+                <div><span>Vreme</span><strong>{{ appointment.time|time_short }}</strong><small>{{ appointment.duration_minutes }} min</small></div>
             </div>
-            <a class="btn btn-primary" href="{{ url_for('public_booking', slug=salon.slug) }}">Zakazi jos jedan termin</a>
+            <a class="btn btn-primary" href="{{ url_for('public_booking', slug=salon.slug) }}">Zakaži još jedan termin</a>
         </section>
     </main>
 </body>

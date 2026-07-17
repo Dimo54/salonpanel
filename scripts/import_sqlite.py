@@ -57,6 +57,7 @@ def main():
         old.row_factory = sqlite3.Row
 
         service_map = {}
+        service_duration_map = {}
         for service in old.execute("SELECT * FROM services ORDER BY id"):
             row = salon_app.db_execute(
                 """
@@ -76,6 +77,9 @@ def main():
                 returning=True,
             )
             service_map[service["id"]] = row["id"]
+            service_duration_map[service["id"]] = service["duration_minutes"] or 30
+
+        worker_id = salon_app.ensure_salon_default_worker(salon_id)
 
         client_map = {}
         for client in old.execute("SELECT * FROM clients ORDER BY id"):
@@ -96,15 +100,18 @@ def main():
             salon_app.db_execute(
                 """
                 INSERT INTO appointments
-                (salon_id, client_id, service_id, date, time, price, status, source, notes, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (salon_id, client_id, service_id, worker_id, date, time, duration_minutes,
+                 price, status, source, notes, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     salon_id,
                     client_map[appointment["client_id"]],
                     service_map[appointment["service_id"]],
+                    worker_id,
                     appointment["date"],
                     appointment["time"],
+                    service_duration_map[appointment["service_id"]],
                     appointment["price"],
                     appointment["status"],
                     appointment["source"],

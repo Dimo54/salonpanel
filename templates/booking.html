@@ -7,21 +7,33 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
 <body class="booking-body">
-    <main class="booking-shell">
+    <main class="booking-shell booking-shell-wide">
         <section class="booking-hero">
             <span class="eyebrow">Online zakazivanje</span>
             <h1>{{ settings.business_name }}</h1>
             <p>{{ settings.booking_note }}</p>
+            <div class="booking-mode-pill">
+                {% if settings.booking_mode == 'automatic' %}
+                <span class="mode-dot automatic"></span>
+                <div><strong>Automatska potvrda</strong><small>Slobodan termin je odmah rezervisan.</small></div>
+                {% else %}
+                <span class="mode-dot manual"></span>
+                <div><strong>Salon potvrđuje zahtev</strong><small>Termin se čuva dok salon ne odgovori.</small></div>
+                {% endif %}
+            </div>
             <div class="booking-info">
-                <div><span>Telefon</span><strong>{{ settings.phone }}</strong></div>
-                <div><span>Lokacija</span><strong>{{ settings.address }}</strong></div>
-                <div><span>Radno vreme</span><strong>{{ settings.working_hours }}</strong></div>
+                <div><span>Telefon</span><strong>{{ settings.phone or '-' }}</strong></div>
+                <div><span>Lokacija</span><strong>{{ settings.address or '-' }}</strong></div>
+                <div><span>Radno vreme</span><strong>{{ settings.working_hours or (settings.open_time ~ '–' ~ settings.close_time) }}</strong></div>
             </div>
         </section>
 
-        <section class="booking-card">
-            <h2>Posaljite zahtev za termin</h2>
-            <p>Unesite podatke. Termin je aktivan tek kada ga salon potvrdi.</p>
+        <section class="booking-card booking-card-large">
+            <div class="booking-card-head">
+                <span class="step-kicker">Rezervacija termina</span>
+                <h2>{% if settings.booking_mode == 'automatic' %}Izaberite slobodan termin{% else %}Pošaljite zahtev za termin{% endif %}</h2>
+                <p>Prikazuju se samo stvarno slobodna vremena izabranog radnika, na svakih 10 minuta.</p>
+            </div>
 
             {% with messages = get_flashed_messages(with_categories=true) %}
                 {% if messages %}
@@ -33,41 +45,101 @@
                 {% endif %}
             {% endwith %}
 
-            <form method="post" class="form-stack">
-                <label>
-                    Ime i prezime
-                    <input type="text" name="client_name" placeholder="npr. Nikola Petrovic" required>
-                </label>
-                <label>
-                    Telefon
-                    <input type="tel" name="client_phone" placeholder="061..." required>
-                </label>
-                <label>
-                    Usluga
-                    <select name="service_id" required>
-                        <option value="">Izaberite uslugu</option>
-                        {% for service in services %}
-                        <option value="{{ service.id }}">{{ service.name }} - {{ service.price|money }} / {{ service.duration_minutes }} min</option>
-                        {% endfor %}
-                    </select>
-                </label>
-                <div class="booking-row">
-                    <label>
-                        Datum
-                        <input type="date" name="date" min="{{ today_iso }}" required>
-                    </label>
-                    <label>
-                        Vreme
-                        <input type="time" name="time" min="{{ settings.open_time }}" max="{{ settings.close_time }}" required>
-                    </label>
+            {% if not services %}
+            <div class="flash flash-warning">Salon trenutno nema aktivne usluge dodeljene aktivnim radnicima.</div>
+            {% endif %}
+
+            <form method="post" class="form-stack booking-form" id="bookingForm"
+                  data-availability-url="{{ url_for('public_availability', slug=salon.slug) }}"
+                  data-selected-worker="{{ form_data.get('worker_id', '') }}"
+                  data-selected-time="{{ form_data.get('time', '') }}">
+                <div class="booking-form-section">
+                    <span class="booking-step-number">1</span>
+                    <div class="booking-section-content">
+                        <h3>Usluga i radnik</h3>
+                        <div class="form-grid">
+                            <label>
+                                Usluga
+                                <select name="service_id" id="bookingService" required {% if not services %}disabled{% endif %}>
+                                    <option value="">Izaberite uslugu</option>
+                                    {% for service in services %}
+                                    <option value="{{ service.id }}" {% if form_data.get('service_id')|string == service.id|string %}selected{% endif %}>
+                                        {{ service.name }} · od {{ service.min_price|money }} · od {{ service.min_duration_minutes }} min
+                                    </option>
+                                    {% endfor %}
+                                </select>
+                            </label>
+                            <label>
+                                Radnik
+                                <select name="worker_id" id="bookingWorker" required disabled>
+                                    <option value="">Prvo izaberite uslugu</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div class="booking-selection-summary" id="bookingSelectionSummary" hidden>
+                            <div><span>Cena</span><strong id="bookingPrice">-</strong></div>
+                            <div><span>Trajanje</span><strong id="bookingDuration">-</strong></div>
+                        </div>
+                    </div>
                 </div>
-                <label>
-                    Napomena
-                    <textarea name="notes" rows="3" placeholder="Npr. zelim ranije ako se oslobodi termin"></textarea>
-                </label>
-                <button class="btn btn-primary full" type="submit">Posalji zahtev</button>
+
+                <div class="booking-form-section">
+                    <span class="booking-step-number">2</span>
+                    <div class="booking-section-content">
+                        <h3>Datum</h3>
+                        <div class="date-choice-grid" id="dateChoices"></div>
+                        <label class="custom-date-label">
+                            Drugi datum
+                            <input type="date" name="date" id="bookingDate" min="{{ today_iso }}" value="{{ form_data.get('date', today_iso) }}" required>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="booking-form-section">
+                    <span class="booking-step-number">3</span>
+                    <div class="booking-section-content">
+                        <div class="time-slot-heading">
+                            <div>
+                                <h3>Slobodno vreme</h3>
+                                <p>Izaberite jedan od ponuđenih termina.</p>
+                            </div>
+                            <span class="ten-minute-badge">na 10 min</span>
+                        </div>
+                        <input type="hidden" name="time" id="bookingTime" value="{{ form_data.get('time', '') }}">
+                        <div class="time-slot-status" id="timeSlotStatus">Izaberite uslugu, radnika i datum.</div>
+                        <div class="time-slot-grid" id="timeSlots"></div>
+                    </div>
+                </div>
+
+                <div class="booking-form-section">
+                    <span class="booking-step-number">4</span>
+                    <div class="booking-section-content">
+                        <h3>Vaši podaci</h3>
+                        <div class="form-grid">
+                            <label>
+                                Ime i prezime
+                                <input type="text" name="client_name" value="{{ form_data.get('client_name', '') }}" placeholder="npr. Nikola Petrović" required>
+                            </label>
+                            <label>
+                                Telefon
+                                <input type="tel" name="client_phone" value="{{ form_data.get('client_phone', '') }}" placeholder="061..." required>
+                            </label>
+                            <label class="span-two">
+                                Napomena
+                                <textarea name="notes" rows="3" placeholder="Npr. želim ranije ako se oslobodi termin">{{ form_data.get('notes', '') }}</textarea>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <button class="btn btn-primary full booking-submit" type="submit" {% if not services %}disabled{% endif %}>
+                    {% if settings.booking_mode == 'automatic' %}Rezerviši termin{% else %}Pošalji zahtev{% endif %}
+                </button>
             </form>
         </section>
     </main>
+
+    <script id="bookingData" type="application/json">{{ booking_data|tojson }}</script>
+    <script src="{{ url_for('static', filename='js/booking.js') }}"></script>
 </body>
 </html>

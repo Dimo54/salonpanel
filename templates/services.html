@@ -5,7 +5,7 @@
     <div>
         <span class="eyebrow">Cenovnik</span>
         <h1>Usluge</h1>
-        <p class="lead">Upravljaj uslugama koje se nude u admin panelu i javnom zakazivanju.</p>
+        <p class="lead">Upravljaj osnovnim spiskom usluga. Cena za klijenta se zatim podešava posebno kod svakog radnika.</p>
     </div>
     <a class="btn btn-primary" href="{{ url_for('service_new') }}">+ Nova usluga</a>
 </div>
@@ -23,6 +23,7 @@
         <div class="service-price">{{ service.price|money }}</div>
         <div class="service-meta">
             <span>{{ service.duration_minutes }} min</span>
+            <span>{{ service.worker_count }} radnika</span>
             <span>{{ service.total_appointments }} termina</span>
             <span>{{ service.revenue|money }}</span>
         </div>
