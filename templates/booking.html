@@ -51,7 +51,9 @@
 
             <form method="post" class="form-stack booking-form" id="bookingForm"
                   data-availability-url="{{ url_for('public_availability', slug=salon.slug) }}"
+                  data-dates-url="{{ url_for('public_available_dates', slug=salon.slug) }}"
                   data-selected-worker="{{ form_data.get('worker_id', '') }}"
+                  data-selected-date="{{ form_data.get('date', '') }}"
                   data-selected-time="{{ form_data.get('time', '') }}">
                 <div class="booking-form-section">
                     <span class="booking-step-number">1</span>
@@ -87,10 +89,15 @@
                     <span class="booking-step-number">2</span>
                     <div class="booking-section-content">
                         <h3>Datum</h3>
+                        <p class="booking-section-help">Prikazuju se samo dani kada izabrani radnik radi i ima bar jedan slobodan termin.</p>
+                        <div class="date-availability-status" id="dateAvailabilityStatus">Prvo izaberite uslugu i radnika.</div>
                         <div class="date-choice-grid" id="dateChoices"></div>
                         <label class="custom-date-label">
-                            Drugi datum
-                            <input type="date" name="date" id="bookingDate" min="{{ today_iso }}" value="{{ form_data.get('date', today_iso) }}" required>
+                            Svi dostupni datumi
+                            <select name="date" id="bookingDate" required disabled>
+                                <option value="">Prvo izaberite uslugu i radnika</option>
+                            </select>
+                            <small class="field-help">Potpuno zauzeti dani i dani odsustva se ne prikazuju.</small>
                         </label>
                     </div>
                 </div>

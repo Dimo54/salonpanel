@@ -1779,3 +1779,339 @@ input[readonly] {
         grid-template-columns: 1fr;
     }
 }
+
+/* Mobile navigation and phone-first refinements */
+.mobile-topbar,
+.mobile-nav-close,
+.sidebar-backdrop {
+    display: none;
+}
+
+.booking-section-help {
+    margin: -4px 0 12px;
+    color: var(--muted);
+    line-height: 1.55;
+}
+
+.date-availability-status {
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    color: var(--muted);
+    background: rgba(255, 255, 255, 0.045);
+    font-size: 13px;
+}
+
+.date-availability-status.loading {
+    color: #bae6fd;
+}
+
+.date-availability-status.ready {
+    color: #bbf7d0;
+}
+
+.date-availability-status.empty {
+    color: #fde68a;
+}
+
+.date-choice small {
+    display: block;
+    margin-top: 5px;
+    color: #93c5fd;
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.table-wrap {
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
+}
+
+@media (max-width: 880px) {
+    body.nav-open {
+        overflow: hidden;
+    }
+
+    .mobile-topbar {
+        position: sticky;
+        top: 0;
+        z-index: 70;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 68px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(5, 12, 24, 0.94);
+        backdrop-filter: blur(22px);
+    }
+
+    .mobile-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+    }
+
+    .mobile-brand .brand-mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 14px;
+        flex: 0 0 auto;
+    }
+
+    .mobile-brand strong,
+    .mobile-brand small {
+        display: block;
+        max-width: 58vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .mobile-brand small {
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 11px;
+    }
+
+    .mobile-nav-toggle {
+        width: 46px;
+        height: 46px;
+        display: grid;
+        place-content: center;
+        gap: 5px;
+        flex: 0 0 auto;
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.07);
+        cursor: pointer;
+    }
+
+    .mobile-nav-toggle span {
+        width: 21px;
+        height: 2px;
+        border-radius: 999px;
+        background: white;
+    }
+
+    .app-shell {
+        display: block;
+        min-height: calc(100vh - 68px);
+    }
+
+    .sidebar {
+        position: fixed;
+        inset: 0 auto 0 0;
+        z-index: 90;
+        width: min(86vw, 330px);
+        height: 100dvh;
+        padding: 20px 16px;
+        overflow-y: auto;
+        border-right: 1px solid var(--line);
+        border-bottom: 0;
+        background: #07111f;
+        transform: translateX(-105%);
+        transition: transform 0.22s ease;
+        box-shadow: 20px 0 70px rgba(0, 0, 0, 0.5);
+    }
+
+    .sidebar.is-open {
+        transform: translateX(0);
+    }
+
+    .sidebar .nav-list {
+        display: grid;
+        overflow: visible;
+        padding-bottom: 0;
+    }
+
+    .sidebar .nav-link {
+        white-space: normal;
+    }
+
+    .sidebar .sidebar-card,
+    .sidebar .logout-link {
+        display: block;
+    }
+
+    .mobile-nav-close {
+        position: absolute;
+        top: 14px;
+        right: 14px;
+        display: grid;
+        place-items: center;
+        width: 40px;
+        height: 40px;
+        padding: 0;
+        border: 1px solid var(--line);
+        border-radius: 13px;
+        color: white;
+        background: rgba(255, 255, 255, 0.07);
+        font-size: 27px;
+        line-height: 1;
+        cursor: pointer;
+    }
+
+    .sidebar > .brand {
+        padding-right: 48px;
+    }
+
+    .sidebar-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 80;
+        background: rgba(0, 0, 0, 0.58);
+        backdrop-filter: blur(3px);
+    }
+
+    body.nav-open .sidebar-backdrop {
+        display: block;
+    }
+
+    .main-content {
+        width: 100%;
+        padding: 20px 14px 34px;
+    }
+
+    .page-head {
+        gap: 16px;
+    }
+
+    .page-head > .head-actions,
+    .page-head > .btn {
+        width: 100%;
+    }
+
+    .page-head > .head-actions .btn,
+    .page-head > .btn {
+        flex: 1 1 auto;
+    }
+
+    .panel-head {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .filter-form .btn,
+    .form-actions .btn {
+        min-height: 46px;
+    }
+
+    input,
+    select,
+    textarea {
+        min-height: 48px;
+        font-size: 16px;
+    }
+
+    textarea {
+        min-height: 110px;
+    }
+
+    .check-row input,
+    input[type="checkbox"],
+    input[type="radio"] {
+        min-height: 0;
+    }
+}
+
+@media (max-width: 560px) {
+    h1 {
+        font-size: clamp(30px, 11vw, 44px);
+        line-height: 1;
+    }
+
+    .booking-shell-wide {
+        width: min(100% - 20px, 760px);
+        gap: 20px;
+        padding: 22px 0 34px;
+    }
+
+    .booking-shell-wide .booking-hero {
+        padding: 0 4px;
+    }
+
+    .booking-hero h1 {
+        font-size: clamp(38px, 13vw, 58px);
+    }
+
+    .booking-info {
+        grid-template-columns: 1fr;
+    }
+
+    .booking-card-large {
+        border-radius: 22px;
+        padding: 14px;
+    }
+
+    .booking-card-head {
+        padding: 4px 2px 0;
+    }
+
+    .booking-card-head h2 {
+        font-size: 22px;
+    }
+
+    .booking-form-section {
+        gap: 10px;
+        padding: 13px;
+        border-radius: 17px;
+    }
+
+    .booking-step-number {
+        width: 30px;
+        height: 30px;
+    }
+
+    .date-choice-grid {
+        grid-template-columns: repeat(7, 94px);
+        margin-right: -13px;
+        padding-right: 13px;
+        scroll-snap-type: x proximity;
+    }
+
+    .date-choice {
+        min-width: 94px;
+        min-height: 72px;
+        scroll-snap-align: start;
+    }
+
+    .custom-date-label {
+        max-width: none;
+    }
+
+    .time-slot-grid {
+        max-height: none;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .time-slot {
+        min-height: 48px;
+    }
+
+    .booking-submit {
+        position: sticky;
+        bottom: 8px;
+        z-index: 10;
+        min-height: 56px;
+        box-shadow: 0 16px 35px rgba(0, 0, 0, 0.45);
+    }
+
+    .calendar-panel {
+        margin-left: -2px;
+        margin-right: -2px;
+    }
+
+    .sticky-actions {
+        bottom: 8px;
+        display: grid;
+        grid-template-columns: 1fr;
+    }
+
+    .sticky-actions .btn {
+        width: 100%;
+    }
+}

@@ -7,8 +7,22 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
 <body class="app-body">
+    <header class="mobile-topbar">
+        <a class="mobile-brand" href="{% if current_salon %}{{ url_for('dashboard') }}{% elif current_user and current_user.role == 'super_admin' %}{{ url_for('super_admin_dashboard') }}{% else %}{{ url_for('login') }}{% endif %}">
+            <span class="brand-mark">SP</span>
+            <span>
+                <strong>{% if current_salon %}{{ current_salon.name }}{% else %}SalonPanel{% endif %}</strong>
+                <small>Upravljački panel</small>
+            </span>
+        </a>
+        <button class="mobile-nav-toggle" id="mobileNavToggle" type="button" aria-controls="appSidebar" aria-expanded="false" aria-label="Otvori navigaciju">
+            <span></span><span></span><span></span>
+        </button>
+    </header>
+    <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
     <div class="app-shell">
-        <aside class="sidebar">
+        <aside class="sidebar" id="appSidebar">
+            <button class="mobile-nav-close" id="mobileNavClose" type="button" aria-label="Zatvori navigaciju">×</button>
             {% if current_salon %}
             <a href="{{ url_for('dashboard') }}" class="brand">
                 <span class="brand-mark">SP</span>

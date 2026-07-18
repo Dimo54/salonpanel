@@ -1,4 +1,44 @@
 document.addEventListener("DOMContentLoaded", function () {
+    var sidebar = document.getElementById("appSidebar");
+    var navToggle = document.getElementById("mobileNavToggle");
+    var navClose = document.getElementById("mobileNavClose");
+    var navBackdrop = document.getElementById("sidebarBackdrop");
+
+    function setMobileNav(open) {
+        if (!sidebar || !navToggle) {
+            return;
+        }
+        sidebar.classList.toggle("is-open", open);
+        document.body.classList.toggle("nav-open", open);
+        navToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    if (navToggle && sidebar) {
+        navToggle.addEventListener("click", function () {
+            setMobileNav(!sidebar.classList.contains("is-open"));
+        });
+    }
+    if (navClose) {
+        navClose.addEventListener("click", function () { setMobileNav(false); });
+    }
+    if (navBackdrop) {
+        navBackdrop.addEventListener("click", function () { setMobileNav(false); });
+    }
+    if (sidebar) {
+        sidebar.querySelectorAll("a").forEach(function (link) {
+            link.addEventListener("click", function () {
+                if (window.matchMedia("(max-width: 880px)").matches) {
+                    setMobileNav(false);
+                }
+            });
+        });
+    }
+    document.addEventListener("keydown", function (event) {
+        if (event.key === "Escape") {
+            setMobileNav(false);
+        }
+    });
+
     document.querySelectorAll("form[data-confirm]").forEach(function (form) {
         form.addEventListener("submit", function (event) {
             var message = form.getAttribute("data-confirm") || "Da li ste sigurni?";

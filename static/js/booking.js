@@ -14,8 +14,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
     var serviceSelect = document.getElementById("bookingService");
     var workerSelect = document.getElementById("bookingWorker");
-    var dateInput = document.getElementById("bookingDate");
+    var dateSelect = document.getElementById("bookingDate");
     var dateChoices = document.getElementById("dateChoices");
+    var dateStatusNode = document.getElementById("dateAvailabilityStatus");
     var timeInput = document.getElementById("bookingTime");
     var timeSlots = document.getElementById("timeSlots");
     var statusNode = document.getElementById("timeSlotStatus");
@@ -23,47 +24,36 @@ document.addEventListener("DOMContentLoaded", function () {
     var priceNode = document.getElementById("bookingPrice");
     var durationNode = document.getElementById("bookingDuration");
     var selectedWorker = String(form.dataset.selectedWorker || "");
+    var selectedDate = String(form.dataset.selectedDate || "");
     var selectedTime = String(form.dataset.selectedTime || timeInput.value || "");
-    var requestSequence = 0;
-
-    function localIsoDate(dateValue) {
-        var year = dateValue.getFullYear();
-        var month = String(dateValue.getMonth() + 1).padStart(2, "0");
-        var day = String(dateValue.getDate()).padStart(2, "0");
-        return year + "-" + month + "-" + day;
-    }
-
-    function renderDateChoices() {
-        if (!dateChoices || !dateInput) {
-            return;
-        }
-        dateChoices.innerHTML = "";
-        var formatterDay = new Intl.DateTimeFormat("sr-Latn-RS", { weekday: "short" });
-        var formatterDate = new Intl.DateTimeFormat("sr-Latn-RS", { day: "2-digit", month: "short" });
-        var today = new Date();
-        today.setHours(12, 0, 0, 0);
-        for (var index = 0; index < 7; index += 1) {
-            var current = new Date(today);
-            current.setDate(today.getDate() + index);
-            var iso = localIsoDate(current);
-            var button = document.createElement("button");
-            button.type = "button";
-            button.className = "date-choice" + (dateInput.value === iso ? " active" : "");
-            button.dataset.date = iso;
-            button.innerHTML = "<span>" + (index === 0 ? "Danas" : formatterDay.format(current)) + "</span><strong>" + formatterDate.format(current) + "</strong>";
-            button.addEventListener("click", function () {
-                dateInput.value = this.dataset.date;
-                renderDateChoices();
-                clearSelectedTime();
-                loadAvailability();
-            });
-            dateChoices.appendChild(button);
-        }
-    }
+    var availableDates = [];
+    var dateRequestSequence = 0;
+    var slotRequestSequence = 0;
 
     function formatRsd(value) {
         var amount = Number(value || 0);
         return new Intl.NumberFormat("sr-RS", { maximumFractionDigits: 0 }).format(amount) + " RSD";
+    }
+
+    function parseLocalDate(isoDate) {
+        var parts = String(isoDate || "").split("-").map(Number);
+        if (parts.length !== 3 || parts.some(function (part) { return !Number.isFinite(part); })) {
+            return null;
+        }
+        return new Date(parts[0], parts[1] - 1, parts[2], 12, 0, 0, 0);
+    }
+
+    function formatDateOption(isoDate) {
+        var value = parseLocalDate(isoDate);
+        if (!value) {
+            return isoDate;
+        }
+        return new Intl.DateTimeFormat("sr-Latn-RS", {
+            weekday: "long",
+            day: "2-digit",
+            month: "long",
+            year: "numeric"
+        }).format(value);
     }
 
     function currentAssignment() {
@@ -140,6 +130,85 @@ document.addEventListener("DOMContentLoaded", function () {
         statusNode.className = "time-slot-status" + (kind ? " " + kind : "");
     }
 
+    function setDateStatus(message, kind) {
+        if (!dateStatusNode) {
+            return;
+        }
+        dateStatusNode.textContent = message;
+        dateStatusNode.className = "date-availability-status" + (kind ? " " + kind : "");
+    }
+
+    function clearDates(message) {
+        availableDates = [];
+        selectedDate = "";
+        if (dateSelect) {
+            dateSelect.innerHTML = "";
+            var option = document.createElement("option");
+            option.value = "";
+            option.textContent = message || "Nema dostupnih datuma";
+            dateSelect.appendChild(option);
+            dateSelect.disabled = true;
+        }
+        if (dateChoices) {
+            dateChoices.innerHTML = "";
+        }
+        clearSelectedTime();
+        if (timeSlots) {
+            timeSlots.innerHTML = "";
+        }
+    }
+
+    function renderDateChoices() {
+        if (!dateChoices || !dateSelect) {
+            return;
+        }
+        dateChoices.innerHTML = "";
+        var formatterDay = new Intl.DateTimeFormat("sr-Latn-RS", { weekday: "short" });
+        var formatterDate = new Intl.DateTimeFormat("sr-Latn-RS", { day: "2-digit", month: "short" });
+
+        availableDates.slice(0, 7).forEach(function (item, index) {
+            var dateValue = parseLocalDate(item.date);
+            if (!dateValue) {
+                return;
+            }
+            var button = document.createElement("button");
+            button.type = "button";
+            button.className = "date-choice" + (dateSelect.value === item.date ? " active" : "");
+            button.dataset.date = item.date;
+            var dayLabel = index === 0 ? "Prvi slobodan" : formatterDay.format(dateValue);
+            button.innerHTML = "<span>" + dayLabel + "</span><strong>" + formatterDate.format(dateValue) + "</strong><small>" + item.slots_count + " termina</small>";
+            button.addEventListener("click", function () {
+                dateSelect.value = this.dataset.date;
+                selectedDate = dateSelect.value;
+                renderDateChoices();
+                clearSelectedTime();
+                loadAvailability();
+            });
+            dateChoices.appendChild(button);
+        });
+    }
+
+    function populateDateSelect(dates, keepSelection) {
+        if (!dateSelect) {
+            return;
+        }
+        var wanted = keepSelection ? String(selectedDate || dateSelect.value || "") : "";
+        var exists = dates.some(function (item) { return item.date === wanted; });
+        var chosen = exists ? wanted : (dates[0] ? dates[0].date : "");
+
+        dateSelect.innerHTML = "";
+        dates.forEach(function (item) {
+            var option = document.createElement("option");
+            option.value = item.date;
+            option.textContent = formatDateOption(item.date) + " · " + item.slots_count + " slobodnih";
+            option.selected = item.date === chosen;
+            dateSelect.appendChild(option);
+        });
+        dateSelect.disabled = dates.length === 0;
+        selectedDate = chosen;
+        renderDateChoices();
+    }
+
     function renderSlots(slots) {
         if (!timeSlots || !timeInput) {
             return;
@@ -180,20 +249,90 @@ document.addEventListener("DOMContentLoaded", function () {
         }
     }
 
-    async function loadAvailability() {
-        if (!serviceSelect || !workerSelect || !dateInput || !timeSlots) {
+    async function loadAvailableDates(keepSelection) {
+        if (!serviceSelect || !workerSelect || !dateSelect) {
             return;
         }
         var serviceId = serviceSelect.value;
         var workerId = workerSelect.value;
-        var dateValue = dateInput.value;
+        if (!serviceId || !workerId) {
+            clearDates("Prvo izaberite uslugu i radnika");
+            setDateStatus("Prvo izaberite uslugu i radnika.", "");
+            setStatus("Izaberite uslugu, radnika i datum.", "");
+            return;
+        }
+
+        var sequence = ++dateRequestSequence;
+        dateSelect.disabled = true;
+        clearSelectedTime();
+        if (timeSlots) {
+            timeSlots.innerHTML = "";
+        }
+        setDateStatus("Tražim slobodne datume...", "loading");
+        setStatus("Prvo sačekajte učitavanje dostupnih datuma.", "loading");
+
+        var params = new URLSearchParams({
+            service_id: serviceId,
+            worker_id: workerId,
+            days: "90"
+        });
+        try {
+            var response = await fetch(form.dataset.datesUrl + "?" + params.toString(), {
+                headers: { "Accept": "application/json" },
+                cache: "no-store"
+            });
+            var payload = await response.json();
+            if (sequence !== dateRequestSequence) {
+                return;
+            }
+            if (!response.ok || !payload.ok) {
+                clearDates("Datumi trenutno nisu dostupni");
+                setDateStatus(payload.error || "Nije moguće učitati datume.", "empty");
+                setStatus("Nema datuma za izbor.", "empty");
+                return;
+            }
+
+            availableDates = payload.dates || [];
+            if (!availableDates.length) {
+                clearDates("Nema slobodnih datuma u narednih 90 dana");
+                setDateStatus("Radnik nema slobodan dan u narednih 90 dana.", "empty");
+                setStatus("Nema slobodnih termina.", "empty");
+                return;
+            }
+
+            populateDateSelect(availableDates, keepSelection);
+            setDateStatus(availableDates.length + " dostupnih datuma u narednih 90 dana.", "ready");
+            if (payload.price !== undefined && priceNode) {
+                priceNode.textContent = formatRsd(payload.price);
+            }
+            if (payload.duration_minutes !== undefined && durationNode) {
+                durationNode.textContent = payload.duration_minutes + " min";
+            }
+            loadAvailability();
+        } catch (error) {
+            if (sequence !== dateRequestSequence) {
+                return;
+            }
+            clearDates("Datumi trenutno nisu dostupni");
+            setDateStatus("Nije moguće učitati datume. Pokušajte ponovo.", "empty");
+            setStatus("Nema datuma za izbor.", "empty");
+        }
+    }
+
+    async function loadAvailability() {
+        if (!serviceSelect || !workerSelect || !dateSelect || !timeSlots) {
+            return;
+        }
+        var serviceId = serviceSelect.value;
+        var workerId = workerSelect.value;
+        var dateValue = dateSelect.value;
         timeSlots.innerHTML = "";
         if (!serviceId || !workerId || !dateValue) {
             setStatus("Izaberite uslugu, radnika i datum.", "");
             return;
         }
 
-        var sequence = ++requestSequence;
+        var sequence = ++slotRequestSequence;
         setStatus("Učitavanje slobodnih termina...", "loading");
         var params = new URLSearchParams({
             service_id: serviceId,
@@ -206,7 +345,7 @@ document.addEventListener("DOMContentLoaded", function () {
                 cache: "no-store"
             });
             var payload = await response.json();
-            if (sequence !== requestSequence) {
+            if (sequence !== slotRequestSequence) {
                 return;
             }
             if (!response.ok || !payload.ok) {
@@ -215,14 +354,14 @@ document.addEventListener("DOMContentLoaded", function () {
                 return;
             }
             renderSlots(payload.slots || []);
-            if (payload.price !== undefined) {
+            if (payload.price !== undefined && priceNode) {
                 priceNode.textContent = formatRsd(payload.price);
             }
-            if (payload.duration_minutes !== undefined) {
+            if (payload.duration_minutes !== undefined && durationNode) {
                 durationNode.textContent = payload.duration_minutes + " min";
             }
         } catch (error) {
-            if (sequence !== requestSequence) {
+            if (sequence !== slotRequestSequence) {
                 return;
             }
             renderSlots([]);
@@ -233,27 +372,38 @@ document.addEventListener("DOMContentLoaded", function () {
     if (serviceSelect) {
         serviceSelect.addEventListener("change", function () {
             selectedWorker = "";
+            selectedDate = "";
             clearSelectedTime();
             populateWorkers(false);
-            loadAvailability();
+            loadAvailableDates(false);
         });
     }
     if (workerSelect) {
         workerSelect.addEventListener("change", function () {
             selectedWorker = workerSelect.value;
+            selectedDate = "";
             clearSelectedTime();
             updateSummary();
-            loadAvailability();
+            loadAvailableDates(false);
         });
     }
-    if (dateInput) {
-        dateInput.addEventListener("change", function () {
+    if (dateSelect) {
+        dateSelect.addEventListener("change", function () {
+            selectedDate = dateSelect.value;
             renderDateChoices();
             clearSelectedTime();
             loadAvailability();
         });
     }
     form.addEventListener("submit", function (event) {
+        if (!dateSelect || !dateSelect.value) {
+            event.preventDefault();
+            setDateStatus("Izaberite jedan od dostupnih datuma.", "empty");
+            if (dateSelect) {
+                dateSelect.scrollIntoView({ behavior: "smooth", block: "center" });
+            }
+            return;
+        }
         if (!timeInput.value) {
             event.preventDefault();
             setStatus("Izaberite jedno slobodno vreme pre slanja.", "empty");
@@ -263,8 +413,7 @@ document.addEventListener("DOMContentLoaded", function () {
         }
     });
 
-    renderDateChoices();
     populateWorkers(true);
     updateSummary();
-    loadAvailability();
+    loadAvailableDates(true);
 });

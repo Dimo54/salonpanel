@@ -964,6 +964,129 @@ def available_slots_for_worker(salon, worker_id, service_id, appointment_date):
     }, None
 
 
+
+def available_dates_for_worker(salon, worker_id, service_id, start_date=None, days=90):
+    selected_start = parse_iso_date(start_date) or local_today()
+    if selected_start < local_today():
+        selected_start = local_today()
+
+    try:
+        days = max(1, min(int(days), 180))
+    except (TypeError, ValueError):
+        days = 90
+    selected_end = selected_start + timedelta(days=days - 1)
+
+    assignment = worker_service_assignment(salon["id"], worker_id, service_id, active_only=True)
+    if not assignment:
+        return None, "Izabrani radnik ne pruza ovu uslugu."
+
+    duration_minutes = int(assignment["worker_duration_minutes"] or 0)
+    open_minutes = time_to_minutes(salon["open_time"])
+    close_minutes = time_to_minutes(salon["close_time"])
+    if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+        return None, "Radno vreme salona nije pravilno podeseno."
+    if duration_minutes <= 0 or duration_minutes > close_minutes - open_minutes:
+        return {
+            "dates": [],
+            "price": float(assignment["worker_price"] or 0),
+            "duration_minutes": duration_minutes,
+            "worker_name": assignment["worker_name"],
+            "service_name": assignment["service_name"],
+        }, None
+
+    appointment_rows = db_query(
+        """
+        SELECT a.date, a.time, a.duration_minutes
+        FROM appointments a
+        WHERE a.salon_id = %s AND a.worker_id = %s
+          AND a.date BETWEEN %s AND %s
+          AND a.status IN ('pending', 'scheduled')
+        ORDER BY a.date, a.time
+        """,
+        (salon["id"], worker_id, selected_start, selected_end),
+    )
+    absence_rows = db_query(
+        """
+        SELECT start_date, end_date, start_time, end_time, all_day
+        FROM worker_time_off
+        WHERE salon_id = %s AND worker_id = %s
+          AND start_date <= %s AND end_date >= %s
+        ORDER BY start_date, start_time NULLS FIRST
+        """,
+        (salon["id"], worker_id, selected_end, selected_start),
+    )
+
+    appointments_by_date = {}
+    for row in appointment_rows:
+        row_date = parse_iso_date(row["date"])
+        row_start = time_to_minutes(row["time"])
+        if not row_date or row_start is None:
+            continue
+        appointments_by_date.setdefault(row_date, []).append(
+            (row_start, row_start + int(row.get("duration_minutes") or 30))
+        )
+
+    normalized_absences = []
+    for row in absence_rows:
+        absence_start_date = parse_iso_date(row["start_date"])
+        absence_end_date = parse_iso_date(row["end_date"])
+        if not absence_start_date or not absence_end_date:
+            continue
+        normalized_absences.append(
+            {
+                "start_date": absence_start_date,
+                "end_date": absence_end_date,
+                "start_time": time_to_minutes(row.get("start_time")),
+                "end_time": time_to_minutes(row.get("end_time")),
+                "all_day": bool(row["all_day"]),
+            }
+        )
+
+    first_slot = ((open_minutes + BOOKING_SLOT_MINUTES - 1) // BOOKING_SLOT_MINUTES) * BOOKING_SLOT_MINUTES
+    now = local_now()
+    available_dates = []
+
+    for offset in range(days):
+        current_date = selected_start + timedelta(days=offset)
+        current_minutes = now.hour * 60 + now.minute if current_date == now.date() else None
+        appointment_ranges = appointments_by_date.get(current_date, [])
+        absence_ranges = []
+        all_day_absence = False
+
+        for absence in normalized_absences:
+            if not (absence["start_date"] <= current_date <= absence["end_date"]):
+                continue
+            if absence["all_day"] or absence["start_time"] is None or absence["end_time"] is None:
+                all_day_absence = True
+                break
+            absence_ranges.append((absence["start_time"], absence["end_time"]))
+
+        if all_day_absence:
+            continue
+
+        slots_count = 0
+        for start_minutes in range(first_slot, close_minutes - duration_minutes + 1, BOOKING_SLOT_MINUTES):
+            end_minutes = start_minutes + duration_minutes
+            if current_minutes is not None and start_minutes <= current_minutes:
+                continue
+            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in appointment_ranges):
+                continue
+            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in absence_ranges):
+                continue
+            slots_count += 1
+
+        if slots_count:
+            available_dates.append({"date": current_date.isoformat(), "slots_count": slots_count})
+
+    return {
+        "dates": available_dates,
+        "price": float(assignment["worker_price"] or 0),
+        "duration_minutes": duration_minutes,
+        "worker_name": assignment["worker_name"],
+        "service_name": assignment["service_name"],
+    }, None
+
+
 def persist_appointment_locked(
     salon,
     client_id,
@@ -2190,6 +2313,32 @@ def public_booking_context(salon, form_data=None):
         "salon": salon,
         "form_data": form_data or {},
     }
+
+
+@app.route("/api/s/<slug>/available-dates")
+def public_available_dates(slug):
+    salon = db_query("SELECT * FROM salons WHERE slug = %s", (slug,), one=True)
+    if not salon or not subscription_is_allowed(salon):
+        return jsonify({"ok": False, "error": "Zakazivanje trenutno nije dostupno."}), 404
+    try:
+        service_id = int(request.args.get("service_id", ""))
+        worker_id = int(request.args.get("worker_id", ""))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Izaberite uslugu i radnika."}), 400
+
+    start_date = request.args.get("start_date", "").strip() or None
+    result, error = available_dates_for_worker(
+        salon,
+        worker_id,
+        service_id,
+        start_date=start_date,
+        days=request.args.get("days", "90"),
+    )
+    if error:
+        return jsonify({"ok": False, "error": error, "dates": []}), 400
+    response = jsonify({"ok": True, **result})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/s/<slug>/availability")
