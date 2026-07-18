@@ -132,6 +132,11 @@
                                 <input type="tel" name="client_phone" value="{{ form_data.get('client_phone', '') }}" placeholder="061..." required>
                             </label>
                             <label class="span-two">
+                                Email
+                                <input type="email" name="client_email" value="{{ form_data.get('client_email', '') }}" placeholder="ime@gmail.com" required>
+                                <small class="field-help">Na ovu adresu stiže potvrda i podsetnik za termin.</small>
+                            </label>
+                            <label class="span-two">
                                 Napomena
                                 <textarea name="notes" rows="3" placeholder="Npr. želim ranije ako se oslobodi termin">{{ form_data.get('notes', '') }}</textarea>
                             </label>

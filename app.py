@@ -24,6 +24,7 @@ from flask import (
     url_for,
 )
 from werkzeug.security import check_password_hash, generate_password_hash
+from email_service import send_appointment_confirmation
 
 APP_NAME = "SalonPanel"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
@@ -653,11 +654,10 @@ def get_or_create_client(salon_id, name, phone=None, email=None, notes=None):
             one=True,
         )
         if existing:
-            if name and existing["name"] != name:
-                db_execute(
-                    "UPDATE clients SET name = %s, email = COALESCE(NULLIF(%s, ''), email) WHERE id = %s AND salon_id = %s",
-                    (name, email, existing["id"], salon_id),
-                )
+            db_execute(
+                "UPDATE clients SET name = COALESCE(NULLIF(%s, ''), name), email = COALESCE(NULLIF(%s, ''), email) WHERE id = %s AND salon_id = %s",
+                (name, email, existing["id"], salon_id),
+            )
             return existing["id"]
 
     existing_by_name = db_query(
@@ -666,6 +666,10 @@ def get_or_create_client(salon_id, name, phone=None, email=None, notes=None):
         one=True,
     )
     if existing_by_name:
+        db_execute(
+            "UPDATE clients SET phone = COALESCE(NULLIF(%s, ''), phone), email = COALESCE(NULLIF(%s, ''), email) WHERE id = %s AND salon_id = %s",
+            (phone, email, existing_by_name["id"], salon_id),
+        )
         return existing_by_name["id"]
 
     row = db_execute(
@@ -1588,6 +1592,7 @@ def save_appointment(appointment_id=None):
     salon_id = salon["id"]
     client_name = request.form.get("client_name", "").strip()
     client_phone = request.form.get("client_phone", "").strip()
+    client_email = request.form.get("client_email", "").strip().lower()
     service_id = request.form.get("service_id", "").strip()
     worker_id = request.form.get("worker_id", "").strip()
     appointment_date = request.form.get("date", "").strip()
@@ -1614,7 +1619,7 @@ def save_appointment(appointment_id=None):
 
     duration_minutes = int(assignment["worker_duration_minutes"] or 30)
     price = max(0.0, parse_price(request.form.get("price"), fallback=assignment["worker_price"]))
-    client_id = get_or_create_client(salon_id, client_name, client_phone)
+    client_id = get_or_create_client(salon_id, client_name, client_phone, client_email)
     saved_id, error = persist_appointment_locked(
         salon,
         client_id,
@@ -1633,6 +1638,24 @@ def save_appointment(appointment_id=None):
         flash(error, "error")
         return False
     return bool(saved_id)
+
+
+def appointment_email_data(appointment_id, salon_id):
+    return db_query(
+        """
+        SELECT a.date, a.time, c.name AS client_name, c.email AS client_email,
+               s.name AS service_name, w.name AS worker_name, sal.name AS salon_name,
+               sal.address AS salon_address, sal.phone AS salon_phone
+        FROM appointments a
+        JOIN clients c ON c.id = a.client_id
+        JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
+        JOIN salons sal ON sal.id = a.salon_id
+        WHERE a.id = %s AND a.salon_id = %s
+        """,
+        (appointment_id, salon_id),
+        one=True,
+    )
 
 
 @app.route("/appointments/<int:appointment_id>/status", methods=["POST"])
@@ -1654,6 +1677,7 @@ def appointment_status(appointment_id):
         flash("Termin nije pronadjen.", "error")
         return redirect(request.referrer or url_for("appointments"))
 
+    previous_status = appointment["status"]
     if new_status in ("pending", "scheduled"):
         _, error = persist_appointment_locked(
             salon,
@@ -1677,7 +1701,15 @@ def appointment_status(appointment_id):
             "UPDATE appointments SET status = %s, updated_at = %s WHERE id = %s AND salon_id = %s",
             (new_status, datetime.now(), appointment_id, salon_id),
         )
-    flash("Status termina je promenjen.", "success")
+    if new_status == "scheduled" and previous_status != "scheduled":
+        email_data = appointment_email_data(appointment_id, salon_id)
+        sent, email_error = send_appointment_confirmation(email_data or {})
+        if sent:
+            flash("Status termina je promenjen i klijentu je poslat email.", "success")
+        else:
+            flash(f"Status je promenjen, ali email nije poslat: {email_error}", "warning")
+    else:
+        flash("Status termina je promenjen.", "success")
     return redirect(request.referrer or url_for("appointments"))
 
 
@@ -2372,6 +2404,7 @@ def public_booking(slug):
     if request.method == "POST":
         client_name = request.form.get("client_name", "").strip()
         client_phone = request.form.get("client_phone", "").strip()
+        client_email = request.form.get("client_email", "").strip().lower()
         service_id = request.form.get("service_id", "").strip()
         worker_id = request.form.get("worker_id", "").strip()
         appointment_date = request.form.get("date", "").strip()
@@ -2386,8 +2419,8 @@ def public_booking(slug):
             service_id = None
             worker_id = None
 
-        if not client_name or not client_phone or not service_id or not worker_id or not appointment_date or not appointment_time:
-            flash("Popunite ime, telefon, uslugu, radnika, datum i vreme.", "error")
+        if not client_name or not client_phone or not client_email or not service_id or not worker_id or not appointment_date or not appointment_time:
+            flash("Popunite ime, telefon, email, uslugu, radnika, datum i vreme.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
 
         assignment = worker_service_assignment(salon_id, worker_id, service_id, active_only=True)
@@ -2395,7 +2428,7 @@ def public_booking(slug):
             flash("Izabrani radnik trenutno ne pruza ovu uslugu.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
 
-        client_id = get_or_create_client(salon_id, client_name, client_phone)
+        client_id = get_or_create_client(salon_id, client_name, client_phone, client_email)
         status = "scheduled" if salon.get("booking_mode") == "automatic" else "pending"
         appointment_id, error = persist_appointment_locked(
             salon,
@@ -2414,6 +2447,11 @@ def public_booking(slug):
         if error:
             flash(error + " Osvezite listu i izaberite drugi termin.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
+        if status == "scheduled":
+            email_data = appointment_email_data(appointment_id, salon_id)
+            sent, email_error = send_appointment_confirmation(email_data or {})
+            if not sent:
+                app.logger.warning("Automatska potvrda za termin %s nije poslata: %s", appointment_id, email_error)
         return redirect(url_for("booking_success", slug=slug, appointment_id=appointment_id))
 
     return render_template("booking.html", **public_booking_context(salon))

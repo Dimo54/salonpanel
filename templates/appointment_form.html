@@ -22,6 +22,10 @@
                 <input type="text" name="client_phone" value="{{ appointment.get('client_phone', '') }}" placeholder="061...">
             </label>
             <label>
+                Email
+                <input type="email" name="client_email" value="{{ appointment.get('client_email', '') }}" placeholder="ime@gmail.com">
+            </label>
+            <label>
                 Usluga
                 <select name="service_id" id="serviceSelect" required>
                     <option value="">Izaberi uslugu</option>
