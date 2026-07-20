@@ -3709,21 +3709,33 @@ def super_admin_update_subscription(salon_id):
         status = "trial"
     if plan not in PLAN_LABELS:
         plan = "trial"
-    db_execute(
-        """
-        UPDATE salons
-        SET subscription_status = %s, subscription_plan = %s, trial_ends_at = %s, updated_at = %s
-        WHERE id = %s
-        """,
-        (status, plan, trial_ends_at, datetime.now(), salon_id),
-    )
-    db_execute(
-        """
-        INSERT INTO subscription_events (salon_id, provider, event_type, payload)
-        VALUES (%s, 'manual', 'super_admin_update', jsonb_build_object('status', %s, 'plan', %s))
-        """,
-        (salon_id, status, plan),
-    )
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE salons
+                SET subscription_status = %s, subscription_plan = %s, trial_ends_at = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (status, plan, trial_ends_at, datetime.now(), salon_id),
+            )
+            cur.execute(
+                """
+                INSERT INTO subscription_events (salon_id, provider, event_type, payload)
+                VALUES (
+                    %s,
+                    'manual',
+                    'super_admin_update',
+                    jsonb_build_object('status', %s::text, 'plan', %s::text)
+                )
+                """,
+                (salon_id, status, plan),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     flash("Pretplata je azurirana.", "success")
     return redirect(url_for("super_admin_salon_detail", salon_id=salon_id))
 
