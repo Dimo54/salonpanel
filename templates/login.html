@@ -3,6 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Prijava - SalonPanel</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
@@ -50,9 +51,12 @@
                 </label>
                 <button class="btn btn-primary full" type="submit">Udji u aplikaciju</button>
             </form>
-            <p class="hint">Nema vise javno upisanih demo podataka. Tvoj super admin nalog se pravi preko Render environment varijabli.</p>
-            <a href="{{ url_for('register') }}" class="public-link">Registruj novi salon</a>
+            <div class="auth-links">
+                <a href="{{ url_for('forgot_password') }}" class="public-link">Zaboravili ste šifru?</a>
+                <a href="{{ url_for('register') }}" class="public-link">Registruj novi salon</a>
+            </div>
         </section>
     </main>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
 </body>
 </html>

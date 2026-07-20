@@ -27,6 +27,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var selectedDate = String(form.dataset.selectedDate || "");
     var selectedTime = String(form.dataset.selectedTime || timeInput.value || "");
     var availableDates = [];
+    var maxDays = String(form.dataset.maxDays || "90");
     var dateRequestSequence = 0;
     var slotRequestSequence = 0;
 
@@ -274,7 +275,7 @@ document.addEventListener("DOMContentLoaded", function () {
         var params = new URLSearchParams({
             service_id: serviceId,
             worker_id: workerId,
-            days: "90"
+            days: String(Number(maxDays) + 1)
         });
         try {
             var response = await fetch(form.dataset.datesUrl + "?" + params.toString(), {
@@ -294,14 +295,14 @@ document.addEventListener("DOMContentLoaded", function () {
 
             availableDates = payload.dates || [];
             if (!availableDates.length) {
-                clearDates("Nema slobodnih datuma u narednih 90 dana");
-                setDateStatus("Radnik nema slobodan dan u narednih 90 dana.", "empty");
+                clearDates("Nema slobodnih datuma u narednih " + maxDays + " dana");
+                setDateStatus("Radnik nema slobodan dan u narednih " + maxDays + " dana.", "empty");
                 setStatus("Nema slobodnih termina.", "empty");
                 return;
             }
 
             populateDateSelect(availableDates, keepSelection);
-            setDateStatus(availableDates.length + " dostupnih datuma u narednih 90 dana.", "ready");
+            setDateStatus(availableDates.length + " dostupnih datuma u narednih " + maxDays + " dana.", "ready");
             if (payload.price !== undefined && priceNode) {
                 priceNode.textContent = formatRsd(payload.price);
             }

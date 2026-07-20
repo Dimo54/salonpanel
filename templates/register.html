@@ -3,6 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Registracija salona - SalonPanel</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
@@ -14,9 +15,9 @@
             <h1>Otvorite salon nalog za nekoliko minuta.</h1>
             <p>Svaki salon dobija odvojene klijente, usluge, termine, podesavanja i javni link za zakazivanje.</p>
             <div class="hero-grid">
-                <div><strong>{{ monthly_price_eur }} EUR</strong><span>Mesecni plan</span></div>
-                <div><strong>{{ yearly_price_eur }} EUR</strong><span>Godisnji plan</span></div>
-                <div><strong>Trial</strong><span>Probni period za testiranje</span></div>
+                <div><strong>{{ monthly_price_eur|euro }}</strong><span>Mesečni plan</span></div>
+                <div><strong>{{ yearly_price_eur|euro }}</strong><span>Godišnji plan</span></div>
+                <div><strong>{{ trial_days }} dana</strong><span>Besplatan probni period</span></div>
             </div>
         </section>
 
@@ -42,32 +43,41 @@
             <form method="post" class="form-stack">
                 <label>
                     Naziv salona
-                    <input type="text" name="salon_name" placeholder="npr. Studio Ana" required>
+                    <input type="text" name="salon_name" value="{{ request.form.get('salon_name', '') }}" placeholder="npr. Studio Ana" required>
                 </label>
                 <label>
                     Tip firme
-                    <input type="text" name="business_type" value="Barber & Beauty Studio" required>
+                    <input type="text" name="business_type" value="{{ request.form.get('business_type', 'Barber & Beauty Studio') }}" required>
                 </label>
                 <label>
                     Ime vlasnika
-                    <input type="text" name="owner_name" placeholder="npr. Ana Petrovic" required>
+                    <input type="text" name="owner_name" value="{{ request.form.get('owner_name', '') }}" placeholder="npr. Ana Petrović" required>
                 </label>
                 <label>
                     Email za prijavu
-                    <input type="email" name="email" autocomplete="username" required>
+                    <input type="email" name="email" value="{{ request.form.get('email', '') }}" autocomplete="username" required>
                 </label>
                 <label>
                     Telefon
-                    <input type="tel" name="phone" placeholder="+381...">
+                    <input type="tel" name="phone" value="{{ request.form.get('phone', '') }}" placeholder="+381...">
                 </label>
                 <label>
-                    Sifra
+                    Šifra
                     <input type="password" name="password" autocomplete="new-password" minlength="8" required>
+                </label>
+                <label>
+                    Ponovite šifru
+                    <input type="password" name="password_confirm" autocomplete="new-password" minlength="8" required>
+                </label>
+                <label class="consent-row">
+                    <input type="checkbox" name="privacy_accepted" required {% if request.form.get('privacy_accepted') %}checked{% endif %}>
+                    <span>Prihvatam <a href="{{ url_for('terms_of_service') }}" target="_blank">Uslove korišćenja</a> i <a href="{{ url_for('privacy_policy') }}" target="_blank">Politiku privatnosti</a>.</span>
                 </label>
                 <button class="btn btn-primary full" type="submit">Kreiraj salon</button>
             </form>
             <a href="{{ url_for('login') }}" class="public-link">Vec imam nalog</a>
         </section>
     </main>
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
 </body>
 </html>

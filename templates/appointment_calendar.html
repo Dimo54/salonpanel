@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Kalendar termina - {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+    <div>
+        <span class="eyebrow">Raspored salona</span>
+        <h1>Kalendar termina</h1>
+        <p class="lead">Dnevni prikaz pokazuje raspored po radnicima, a nedeljni pregled sve termine po danima.</p>
+    </div>
+    <div class="head-actions">
+        <a class="btn btn-secondary" href="{{ url_for('worker_availability_calendar') }}">Odsustva i neradni dani</a>
+        <a class="btn btn-primary" href="{{ url_for('appointment_new') }}">+ Novi termin</a>
+    </div>
+</div>
+
+<section class="panel calendar-command-bar">
+    <div class="calendar-toolbar calendar-toolbar-wide">
+        <div class="head-actions">
+            <a class="btn btn-mini btn-secondary" href="{{ url_for('appointment_calendar', view=view, date=previous_date, worker_id=worker_filter) }}">← Prethodni</a>
+            <a class="btn btn-mini btn-ghost" href="{{ url_for('appointment_calendar', view=view, date=today_iso, worker_id=worker_filter) }}">Danas</a>
+            <a class="btn btn-mini btn-secondary" href="{{ url_for('appointment_calendar', view=view, date=next_date, worker_id=worker_filter) }}">Sledeći →</a>
+        </div>
+        <div class="calendar-current-date">
+            {% if view == 'week' %}
+                <strong>{{ week_start|date_sr }} – {{ week_end|date_sr }}</strong>
+            {% else %}
+                <strong>{{ selected_date|date_sr }}</strong>
+            {% endif %}
+        </div>
+        <form method="get" class="calendar-filter calendar-view-filter">
+            <input type="hidden" name="date" value="{{ selected_date.isoformat() }}">
+            <select name="view" onchange="this.form.submit()">
+                <option value="day" {% if view == 'day' %}selected{% endif %}>Dnevni prikaz</option>
+                <option value="week" {% if view == 'week' %}selected{% endif %}>Nedeljni prikaz</option>
+            </select>
+            <select name="worker_id" onchange="this.form.submit()">
+                <option value="">Svi radnici</option>
+                {% for worker in workers %}
+                <option value="{{ worker.id }}" {% if worker_filter|string == worker.id|string %}selected{% endif %}>{{ worker.name }}</option>
+                {% endfor %}
+            </select>
+        </form>
+    </div>
+</section>
+
+{% if view == 'week' %}
+<div class="week-calendar-grid">
+    {% for day in week_days %}
+    <section class="panel week-day-card {% if day.is_today %}today-card{% endif %}">
+        <div class="week-day-head">
+            <div>
+                <span>{{ ['Ponedeljak','Utorak','Sreda','Četvrtak','Petak','Subota','Nedelja'][loop.index0] }}</span>
+                <strong>{{ day.date|date_sr }}</strong>
+            </div>
+            <a href="{{ url_for('appointment_calendar', view='day', date=day.date.isoformat(), worker_id=worker_filter) }}">Otvori dan</a>
+        </div>
+        <div class="week-appointments">
+            {% for item in day.appointments %}
+            <a class="week-appointment status-border-{{ item.status }}" href="{{ url_for('appointment_edit', appointment_id=item.id) }}">
+                <strong>{{ item.time|time_short }} · {{ item.client_name }}</strong>
+                <span>{{ item.worker_name or 'Bez radnika' }} · {{ item.service_name }}</span>
+                <small>{{ item.status|status_label }}</small>
+            </a>
+            {% else %}
+            <p class="empty-cell">Nema termina.</p>
+            {% endfor %}
+        </div>
+    </section>
+    {% endfor %}
+</div>
+{% else %}
+<section class="panel day-calendar-panel">
+    {% if lanes %}
+    <p class="calendar-swipe-hint">Na telefonu prevucite kalendar levo ili desno da vidite ostale radnike.</p>
+    <div class="day-calendar-scroll">
+        <div class="day-calendar-header" style="grid-template-columns: 76px repeat({{ lanes|length }}, minmax(190px, 1fr)); min-width: {{ 76 + (lanes|length * 190) }}px;">
+            <div></div>
+            {% for lane in lanes %}
+            <div class="worker-column-head">
+                <strong>{{ lane.worker.name }}</strong>
+                {% if lane.schedule %}
+                <span>{{ lane.schedule.open|minutes_time }}–{{ lane.schedule.close|minutes_time }}</span>
+                {% else %}
+                <span>Ne radi</span>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+        <div class="day-calendar-body" style="grid-template-columns: 76px repeat({{ lanes|length }}, minmax(190px, 1fr)); min-width: {{ 76 + (lanes|length * 190) }}px; height: {{ timeline_height }}px;">
+            <div class="time-axis" style="height: {{ timeline_height }}px;">
+                {% for item in time_labels %}
+                <span style="top: {{ item.top }}px;">{{ item.label }}</span>
+                {% endfor %}
+            </div>
+            {% for lane in lanes %}
+            <div class="worker-lane" style="height: {{ timeline_height }}px;">
+                {% if not lane.schedule %}
+                <div class="calendar-block all-day-block" style="top:0;height:{{ timeline_height }}px;">Ne radi</div>
+                {% endif %}
+                {% for block in lane.blocks %}
+                <div class="calendar-block" style="top:{{ block.top }}px;height:{{ block.height }}px;">{{ block.label }}</div>
+                {% endfor %}
+                {% for item in lane.appointments %}
+                <a class="calendar-appointment {{ item.status|status_class }}" style="top:{{ item.top }}px;height:{{ item.height }}px;" href="{{ url_for('appointment_edit', appointment_id=item.id) }}">
+                    <strong>{{ item.time|time_short }} · {{ item.client_name }}</strong>
+                    <span>{{ item.service_name }}</span>
+                    <small>{{ item.status|status_label }}</small>
+                </a>
+                {% endfor %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <h2>Nema aktivnih radnika za prikaz</h2>
+        <p>Dodajte ili aktivirajte radnika da bi se pojavio u kalendaru.</p>
+        <a class="btn btn-primary" href="{{ url_for('workers') }}">Otvori radnike</a>
+    </div>
+    {% endif %}
+</section>
+{% endif %}
+{% endblock %}

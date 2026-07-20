@@ -3,6 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>Zakazivanje - {{ settings.business_name }}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
@@ -54,7 +55,8 @@
                   data-dates-url="{{ url_for('public_available_dates', slug=salon.slug) }}"
                   data-selected-worker="{{ form_data.get('worker_id', '') }}"
                   data-selected-date="{{ form_data.get('date', '') }}"
-                  data-selected-time="{{ form_data.get('time', '') }}">
+                  data-selected-time="{{ form_data.get('time', '') }}"
+                  data-max-days="{{ settings.booking_max_days }}">
                 <div class="booking-form-section">
                     <span class="booking-step-number">1</span>
                     <div class="booking-section-content">
@@ -141,6 +143,16 @@
                                 <textarea name="notes" rows="3" placeholder="Npr. želim ranije ako se oslobodi termin">{{ form_data.get('notes', '') }}</textarea>
                             </label>
                         </div>
+                        <div class="consent-stack">
+                            <label class="consent-row">
+                                <input type="checkbox" name="privacy_accepted" required {% if form_data.get('privacy_accepted') %}checked{% endif %}>
+                                <span>Saglasan/na sam da salon obradi moje podatke radi zakazivanja, u skladu sa <a href="{{ url_for('privacy_policy') }}" target="_blank">Politikom privatnosti</a>.</span>
+                            </label>
+                            <label class="consent-row">
+                                <input type="checkbox" name="marketing_accepted" {% if form_data.get('marketing_accepted') %}checked{% endif %}>
+                                <span>Želim da dobijam povremene ponude salona. Ovo nije obavezno za zakazivanje.</span>
+                            </label>
+                        </div>
                     </div>
                 </div>
 
@@ -151,6 +163,7 @@
         </section>
     </main>
 
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
     <script id="bookingData" type="application/json">{{ booking_data|tojson }}</script>
     <script src="{{ url_for('static', filename='js/booking.js') }}"></script>
 </body>

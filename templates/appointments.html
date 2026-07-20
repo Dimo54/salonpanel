@@ -8,7 +8,8 @@
         <p class="lead">Dodaj, potvrdi, završi ili otkaži termin. Zauzeće se proverava posebno za svakog radnika.</p>
     </div>
     <div class="head-actions">
-        <a class="btn btn-secondary" href="{{ url_for('export_appointments') }}">Export CSV</a>
+        <a class="btn btn-secondary" href="{{ url_for('appointment_calendar') }}">Kalendar</a>
+        <a class="btn btn-secondary" href="{{ url_for('export_appointments') }}">Preuzmi tabelu</a>
         <a class="btn btn-primary" href="{{ url_for('appointment_new') }}">+ Novi termin</a>
     </div>
 </div>
@@ -21,7 +22,7 @@
         </label>
         <label>
             Datum
-            <input type="date" name="date" value="{{ filters.date }}">
+            <input type="text" name="date" value="{{ filters.date }}" placeholder="dd.mm.gggg." inputmode="numeric">
         </label>
         <label>
             Radnik
@@ -90,6 +91,10 @@
                             <form method="post" action="{{ url_for('appointment_status', appointment_id=item.id) }}">
                                 <input type="hidden" name="status" value="completed">
                                 <button class="btn btn-mini btn-green" type="submit">Završeno</button>
+                            </form>
+                            <form method="post" action="{{ url_for('appointment_status', appointment_id=item.id) }}">
+                                <input type="hidden" name="status" value="no_show">
+                                <button class="btn btn-mini btn-warning" type="submit">Nije došao</button>
                             </form>
                             <form method="post" action="{{ url_for('appointment_status', appointment_id=item.id) }}">
                                 <input type="hidden" name="status" value="cancelled">

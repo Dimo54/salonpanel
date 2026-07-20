@@ -1,4 +1,17 @@
 document.addEventListener("DOMContentLoaded", function () {
+    var csrfMeta = document.querySelector('meta[name="csrf-token"]');
+    var csrfToken = csrfMeta ? csrfMeta.getAttribute("content") : "";
+    if (csrfToken) {
+        document.querySelectorAll('form[method="post"], form[method="POST"]').forEach(function (form) {
+            if (!form.querySelector('input[name="csrf_token"]')) {
+                var input = document.createElement("input");
+                input.type = "hidden";
+                input.name = "csrf_token";
+                input.value = csrfToken;
+                form.appendChild(input);
+            }
+        });
+    }
     var sidebar = document.getElementById("appSidebar");
     var navToggle = document.getElementById("mobileNavToggle");
     var navClose = document.getElementById("mobileNavClose");
@@ -160,14 +173,45 @@ document.addEventListener("DOMContentLoaded", function () {
     document.querySelectorAll("[data-calendar-date]").forEach(function (dayButton) {
         dayButton.addEventListener("click", function () {
             if (startDateInput) {
-                startDateInput.value = dayButton.dataset.calendarDate;
+                startDateInput.value = dayButton.dataset.calendarDateSr || dayButton.dataset.calendarDate;
             }
             if (endDateInput) {
-                endDateInput.value = dayButton.dataset.calendarDate;
+                endDateInput.value = dayButton.dataset.calendarDateSr || dayButton.dataset.calendarDate;
             }
             document.querySelectorAll("[data-calendar-date]").forEach(function (node) {
                 node.classList.toggle("selected", node === dayButton);
             });
         });
+    });
+
+    document.querySelectorAll(".schedule-mode-select").forEach(function (select) {
+        function syncScheduleRow() {
+            var row = select.closest(".worker-schedule-row");
+            if (!row) return;
+            var custom = select.value === "custom";
+            var off = select.value === "off";
+            row.querySelectorAll(".schedule-custom-time").forEach(function (input) {
+                input.disabled = !custom;
+            });
+            row.querySelectorAll(".schedule-break-time").forEach(function (input) {
+                input.disabled = off;
+            });
+            row.classList.toggle("schedule-row-off", off);
+        }
+        select.addEventListener("change", syncScheduleRow);
+        syncScheduleRow();
+    });
+
+    document.querySelectorAll(".day-open-toggle").forEach(function (toggle) {
+        function syncDayRow() {
+            var row = toggle.closest(".weekly-hours-row");
+            if (!row) return;
+            row.querySelectorAll(".day-time-input").forEach(function (input) {
+                input.disabled = !toggle.checked;
+            });
+            row.classList.toggle("day-closed", !toggle.checked);
+        }
+        toggle.addEventListener("change", syncDayRow);
+        syncDayRow();
     });
 });

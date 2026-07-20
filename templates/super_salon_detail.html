@@ -66,8 +66,8 @@
                     </select>
                 </label>
                 <label>
-                    Trial vazi do
-                    <input type="date" name="trial_ends_at" value="{{ salon.trial_ends_at }}">
+                    Probni period važi do
+                    <input type="text" name="trial_ends_at" value="{{ salon.trial_ends_at|date_input }}" placeholder="dd.mm.gggg." inputmode="numeric">
                 </label>
             </div>
             <div class="form-actions">

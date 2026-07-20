@@ -52,11 +52,11 @@
             </label>
             <label>
                 Datum
-                <input type="date" name="date" value="{{ appointment.get('date', today_iso) }}" required>
+                <input type="text" name="date" value="{{ appointment.get('date', today_iso)|date_input }}" placeholder="dd.mm.gggg." inputmode="numeric" required>
             </label>
             <label>
                 Vreme
-                <input type="time" name="time" step="600" value="{{ appointment.get('time', '10:00')|time_short }}" required>
+                <input type="text" inputmode="numeric" placeholder="HH:MM" pattern="(?:[01]\d|2[0-3]):[0-5]\d" name="time" value="{{ appointment.get('time', '10:00')|time_short }}" required>
                 <small class="field-help">Početak termina mora biti na svakih 10 minuta.</small>
             </label>
             <label>

@@ -45,6 +45,35 @@
     <section class="panel form-panel">
         <div class="panel-head">
             <div>
+                <h2>Radno vreme i pauze</h2>
+                <p>Radnik može da prati radno vreme salona, da ne radi određenog dana ili da ima sopstveno vreme. Pauza se automatski uklanja iz slobodnih termina.</p>
+            </div>
+        </div>
+        <div class="worker-schedule-table">
+            <div class="worker-schedule-head">
+                <span>Dan</span><span>Režim</span><span>Od</span><span>Do</span><span>Pauza od</span><span>Pauza do</span>
+            </div>
+            {% for day in schedule %}
+            <div class="worker-schedule-row" data-schedule-row="{{ day.weekday }}">
+                <strong>{{ day.name }}</strong>
+                <select class="schedule-mode-select" name="schedule_mode_{{ day.weekday }}" data-weekday="{{ day.weekday }}">
+                    <option value="inherit" {% if day.mode == 'inherit' %}selected{% endif %}>Kao salon</option>
+                    <option value="custom" {% if day.mode == 'custom' %}selected{% endif %}>Posebno vreme</option>
+                    <option value="off" {% if day.mode == 'off' %}selected{% endif %}>Ne radi</option>
+                </select>
+                <input class="schedule-custom-time" type="text" inputmode="numeric" placeholder="HH:MM" pattern="(?:[01]\d|2[0-3]):[0-5]\d" name="schedule_open_{{ day.weekday }}" value="{{ day.open_time|time_short }}">
+                <input class="schedule-custom-time" type="text" inputmode="numeric" placeholder="HH:MM" pattern="(?:[01]\d|2[0-3]):[0-5]\d" name="schedule_close_{{ day.weekday }}" value="{{ day.close_time|time_short }}">
+                <input class="schedule-break-time" type="text" inputmode="numeric" placeholder="HH:MM" pattern="(?:[01]\d|2[0-3]):[0-5]\d" name="break_start_{{ day.weekday }}" value="{{ day.break_start|time_short if day.break_start else '' }}">
+                <input class="schedule-break-time" type="text" inputmode="numeric" placeholder="HH:MM" pattern="(?:[01]\d|2[0-3]):[0-5]\d" name="break_end_{{ day.weekday }}" value="{{ day.break_end|time_short if day.break_end else '' }}">
+            </div>
+            {% endfor %}
+        </div>
+        <p class="field-help">Primer: ako salon radi 09:00–20:00, a Andrea radi 10:00–18:00 sa pauzom 13:00–14:00, klijent će videti samo termine koji staju u te periode.</p>
+    </section>
+
+    <section class="panel form-panel">
+        <div class="panel-head">
+            <div>
                 <h2>Usluge, cene i trajanje</h2>
                 <p>Klijent će moći da izabere samo usluge koje su označene za ovog radnika.</p>
             </div>

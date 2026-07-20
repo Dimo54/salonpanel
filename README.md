@@ -1,54 +1,179 @@
-# SalonPanel SaaS
+# SalonPanel — Paket 1
 
-Ova verzija pretvara pocetni SalonPanel u multi-salon SaaS aplikaciju.
+SalonPanel je višesalonska web aplikacija za zakazivanje termina, vođenje klijenata, radnika, usluga i pretplata. Ova verzija završava prvi paket funkcija koje su važne pre uključivanja pravih salona.
 
-## Sta je promenjeno
+## Šta je novo u Paketu 1
 
-- SQLite je zamenjen PostgreSQL bazom preko `DATABASE_URL`.
-- Svaki salon ima svoj nalog, svoje klijente, usluge i termine.
-- Svaki salon ima javni link: `/s/<slug>/zakazi`.
-- Salon bira rucno ili automatsko potvrdjivanje online termina.
-- Zakazivanje prikazuje samo slobodne termine na svakih 10 minuta.
-- Salon moze dodavati radnike i za svakog podesiti usluge, cenu i trajanje.
-- Vise radnika moze imati termine u isto vreme, ali jedan radnik ne moze imati preklapanje.
-- Kalendar odsustava uklanja neradne dane i blokirane periode iz javnog zakazivanja.
-- Vlasnik platforme ima poseban super admin nalog.
-- Super admin vidi sve salone, njihove statuse, pakete i osnovne metrike.
-- Pretplate su pripremljene za 10 EUR mesecno i 80 EUR godisnje.
-- Paddle online naplata jos nije povezana; status se za sada menja rucno iz super admin panela.
+### 1. Stvarno radno vreme
 
-## Environment variables za Render
+- Salon podešava radno vreme posebno za svaki dan u nedelji.
+- Dan može biti radni ili neradni.
+- Svaki radnik može da:
+  - nasledi radno vreme salona;
+  - ima posebno radno vreme;
+  - ne radi određenog dana.
+- Svaki radnik može imati redovnu pauzu za svaki dan.
+- Postojeća odsustva i neradni periodi ostaju dostupni na posebnoj stranici.
 
-U Render dashboardu, na servisu `salonpanel`, otvori **Environment** i dodaj:
+Ovo je važno zato što se klijentu prikazuju samo termini koji stvarno staju u radno vreme radnika i ne preklapaju se sa pauzama, odsustvima ili drugim terminima.
+
+### 2. Pravi kalendar termina
+
+- Dnevni prikaz sa posebnom kolonom za svakog radnika.
+- Nedeljni prikaz termina.
+- Filter po radniku.
+- Prikaz termina, pauza i odsustava.
+- Stari kalendar je sačuvan kao stranica **Odsustva**.
+
+### 3. Bezbednost naloga i obrazaca
+
+- CSRF zaštita svih obrazaca koji menjaju podatke.
+- Ograničavanje neuspešnih pokušaja prijave.
+- Ograničavanje prevelikog broja javnih zahteva za termin sa iste internet adrese.
+- Obavezna jaka `SECRET_KEY` vrednost na Renderu.
+- Sigurnija podešavanja korisničke sesije i sigurnosna HTTP zaglavlja.
+- Potvrda email adrese.
+- Funkcija „Zaboravljena šifra“ i bezbedan link za promenu šifre.
+- Javni ekran uspešnog zakazivanja koristi nasumičan token, pa se tuđi termini ne mogu pregledati pogađanjem rednih brojeva.
+
+### 4. Email obaveštenja
+
+Preko Brevo servisa aplikacija može slati:
+
+- klijentu da je zahtev primljen;
+- klijentu da je termin potvrđen;
+- klijentu da je termin izmenjen;
+- klijentu da je termin otkazan;
+- podsetnik 24 sata pre termina;
+- podsetnik 2 sata pre termina;
+- salonu da je stigao novi zahtev ili automatski zakazan termin;
+- potvrdu email adrese;
+- link za promenu zaboravljene šifre.
+
+Podsetnici zahtevaju da neki spoljašnji servis pozove zaštićenu adresu `/tasks/send-reminders` jednom na sat.
+
+### 5. Pravila online zakazivanja
+
+Salon može podesiti:
+
+- ručno ili automatsko potvrđivanje;
+- koliko minuta unapred klijent mora da zakaže;
+- koliko dana unapred klijent može da vidi termine;
+- informativni rok za otkazivanje.
+
+### 6. Srpski format datuma
+
+Polja za datum prihvataju format:
+
+```text
+20.07.2026.
+```
+
+Aplikacija i dalje razume i tehnički format `2026-07-20`, što olakšava rad API-ja i migraciju starih podataka.
+
+### 7. Privatnost
+
+- Klijent mora prihvatiti obradu podataka pre slanja zahteva.
+- Marketinška saglasnost je odvojena i nije obavezna.
+- Registracija salona zahteva prihvatanje Uslova korišćenja i Politike privatnosti.
+- Dodate su početne stranice `/privacy` i `/terms`.
+
+**Važno:** tekstovi na tim stranicama su radni nacrti. Pre komercijalnog lansiranja treba da ih pregleda pravnik koji poznaje propise Srbije i zaštitu podataka o ličnosti.
+
+### 8. Pretplata
+
+Podrazumevane cene su:
+
+- mesečni plan: `19.99 EUR`;
+- godišnji plan: `199.99 EUR`;
+- probni period: `14 dana`.
+
+Online naplata još nije povezana. Status pretplate se i dalje može menjati ručno iz super admin panela.
+
+## Da li je domen potreban?
+
+Nije. Sve funkcije mogu da rade preko postojeće Render adrese, na primer:
+
+```text
+https://salonpanel.onrender.com
+```
+
+Domen `salonpanel.rs` može da se kupi i poveže kasnije, kada aplikacija počne da donosi prihod.
+
+## Environment promenljive na Renderu
+
+Environment promenljiva je tajno ili promenljivo podešavanje koje Render čuva izvan GitHub koda. Tako šifre i API ključevi ne postaju javni.
+
+### Obavezne promenljive
 
 ```text
 DATABASE_URL=postgresql://...
-SECRET_KEY=dug-random-string
+SECRET_KEY=duga_nasumicna_vrednost
+APP_BASE_URL=https://salonpanel.onrender.com
+APP_TIMEZONE=Europe/Belgrade
 SUPER_ADMIN_EMAIL=tvoj-email@example.com
 SUPER_ADMIN_PASSWORD=tvoja-jaka-sifra
 SUPER_ADMIN_NAME=Tvoje ime
-TRIAL_DAYS=14
-MONTHLY_PRICE_EUR=10
-YEARLY_PRICE_EUR=80
-APP_TIMEZONE=Europe/Belgrade
 ```
 
-Nemoj slati ove vrednosti u chat i nemoj ih commitovati na GitHub.
+- `DATABASE_URL` povezuje aplikaciju sa Supabase/PostgreSQL bazom.
+- `SECRET_KEY` potpisuje korisničke sesije i bezbednosne tokene. Mora biti duga i tajna.
+- `APP_BASE_URL` omogućava da linkovi u emailovima vode na tačnu javnu adresu aplikacije.
+- `APP_TIMEZONE` određuje lokalno vreme za termine i podsetnike.
+- `SUPER_ADMIN_*` određuju nalog vlasnika platforme.
 
-## Supabase connection string
+Jaku `SECRET_KEY` vrednost možeš napraviti lokalno komandom:
 
-U Supabase projektu idi na **Connect** ili **Project Settings > Database** i kopiraj Postgres connection string.
-Za Render koristi pooled connection string kada je dostupan. U stringu zameni placeholder za password stvarnom database sifrom koju si sacuvao pri kreiranju projekta.
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
-Primer formata:
+Dobijenu vrednost stavi samo u Render Environment. Nemoj je postavljati na GitHub i nemoj je slati drugim ljudima.
+
+### Cene i probni period
 
 ```text
-postgresql://postgres.xxxxx:YOUR_PASSWORD@aws-0-eu-north-1.pooler.supabase.com:6543/postgres
+TRIAL_DAYS=14
+MONTHLY_PRICE_EUR=19.99
+YEARLY_PRICE_EUR=199.99
 ```
 
-Aplikacija ce automatski dodati `sslmode=require` ako ga nema u URL-u.
+Ove vrednosti postoje kao Environment promenljive da bi cena kasnije mogla da se promeni bez menjanja više delova koda.
 
-## Deploy na Render
+### Brevo email
+
+```text
+BREVO_API_KEY=...
+BREVO_SENDER_EMAIL=...
+BREVO_SENDER_NAME=SalonPanel
+```
+
+- `BREVO_API_KEY` dozvoljava aplikaciji da pošalje email preko tvog Brevo naloga.
+- `BREVO_SENDER_EMAIL` je verifikovana adresa pošiljaoca.
+- `BREVO_SENDER_NAME` je ime koje primalac vidi.
+
+Aplikacija će raditi i bez ovih promenljivih, ali emailovi neće biti poslati.
+
+### Automatski podsetnici
+
+```text
+CRON_SECRET=druga_duga_nasumicna_vrednost
+```
+
+`CRON_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu treba da pošalje tajnu u zaglavlju `X-Cron-Secret` ili kao `secret` parametar.
+
+### Opciona zaštita prijave
+
+```text
+LOGIN_MAX_ATTEMPTS=5
+LOGIN_WINDOW_MINUTES=15
+BOOKING_MAX_REQUESTS=8
+BOOKING_WINDOW_MINUTES=30
+```
+
+Prve dve vrednosti privremeno zaustavljaju veliki broj pogrešnih pokušaja prijave sa iste internet adrese. Druge dve ograničavaju spam javnog obrasca za zakazivanje sa iste internet adrese.
+
+## Render podešavanja
 
 Build command:
 
@@ -62,36 +187,43 @@ Start command:
 gunicorn app:app
 ```
 
-Nakon prvog pokretanja aplikacija sama pravi tabele u PostgreSQL bazi i kreira super admin nalog ako su podeseni `SUPER_ADMIN_EMAIL` i `SUPER_ADMIN_PASSWORD`.
+Pri prvom pokretanju nove verzije aplikacija automatski:
 
-Pri prvom pokretanju nove verzije aplikacija automatski dodaje tabele za radnike, njihove usluge i odsustva. Postojecim salonima se pravi pocetni radnik `Glavni radnik`, postojece usluge se dodeljuju njemu, a stari termini se vezuju za tog radnika.
+- dodaje nove kolone i tabele u postojeću bazu;
+- čuva stare salone, klijente, usluge, radnike i termine;
+- pravi početno radno vreme za stare salone;
+- postavlja da postojeći radnici nasleđuju radno vreme salona.
 
-## Prvo logovanje
+Ipak, pre svake veće izmene preporučuje se rezervna kopija baze.
 
-1. Otvori sajt na Renderu.
-2. Uloguj se emailom i sifrom iz `SUPER_ADMIN_EMAIL` i `SUPER_ADMIN_PASSWORD`.
-3. Otvori `/register` da kreiras test salon.
-4. U super admin panelu mozes menjati status pretplate test salona.
+## Supabase veza
 
-## Javno zakazivanje
-
-Svaki salon ima svoj link:
+Za Render je najbolje koristiti pooled PostgreSQL connection string koji dobijaš u Supabase projektu. Primer formata:
 
 ```text
-/s/naziv-salona/zakazi
+postgresql://postgres.xxxxx:YOUR_PASSWORD@aws-0-eu-north-1.pooler.supabase.com:6543/postgres
 ```
 
-Stari `/zakazi` link radi samo ako postoji jedan salon u bazi. Za vise salona koristi se novi link sa slugom.
+Aplikacija automatski dodaje `sslmode=require` ako ga nema.
 
-Klijent najpre bira uslugu i radnika, zatim datum. Aplikacija preko `/api/s/<slug>/availability` vraca samo slotove koji su slobodni tokom celog trajanja usluge. I zahtev na cekanju i potvrdjen termin blokiraju isti period kod izabranog radnika.
+## Kontrolna lista posle objavljivanja
 
-## Migracija starih SQLite podataka
+1. Prijavi se kao super admin.
+2. Otvori postojeći salon i proveri da su podaci ostali sačuvani.
+3. U **Podešavanja** sačuvaj radno vreme za svaki dan.
+4. U **Radnici** otvori svakog radnika i podesi njegovo radno vreme i pauzu.
+5. Otvori **Kalendar** i proveri dnevni i nedeljni prikaz.
+6. Otvori **Odsustva** i napravi probno odsustvo.
+7. Sa javnog linka napravi probni termin.
+8. Proveri da zauzeto vreme više nije ponuđeno drugom klijentu.
+9. Proveri ručno i automatsko potvrđivanje.
+10. Proveri email potvrde, otkazivanje i promenu termina.
+11. Proveri izgled na telefonu.
+12. Proveri „Zaboravljena šifra“ i potvrdu email adrese.
 
-Ako imas staru `salonpanel.sqlite3` bazu, mozes kasnije pokrenuti:
+## Važna ograničenja ove verzije
 
-```bash
-export DATABASE_URL="postgresql://..."
-python scripts/import_sqlite.py /putanja/do/salonpanel.sqlite3 "Naziv salona" "email@salona.com" "Ime vlasnika"
-```
-
-Skripta ce napraviti salon u PostgreSQL bazi i prebaciti stare klijente, usluge i termine.
+- Paddle naplata još nije povezana.
+- Podsetnici ne mogu da se šalju sami dok se ne podesi satni cron poziv.
+- Politika privatnosti i Uslovi korišćenja su nacrti.
+- Pre puštanja većeg broja salona treba napraviti i proveriti strategiju rezervnih kopija Supabase baze.

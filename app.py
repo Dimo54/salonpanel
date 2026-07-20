@@ -3,6 +3,7 @@ import calendar as calendar_module
 import io
 import os
 import re
+import secrets
 import unicodedata
 from datetime import date, datetime, time, timedelta
 from functools import wraps
@@ -23,18 +24,53 @@ from flask import (
     session,
     url_for,
 )
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
-from email_service import send_appointment_confirmation
+from email_service import (
+    email_is_configured,
+    send_appointment_message,
+    send_auth_email,
+    send_salon_new_request,
+)
 
 APP_NAME = "SalonPanel"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
-MONTHLY_PRICE_EUR = int(os.environ.get("MONTHLY_PRICE_EUR", "10"))
-YEARLY_PRICE_EUR = int(os.environ.get("YEARLY_PRICE_EUR", "80"))
+MONTHLY_PRICE_EUR = float(os.environ.get("MONTHLY_PRICE_EUR", "19.99"))
+YEARLY_PRICE_EUR = float(os.environ.get("YEARLY_PRICE_EUR", "199.99"))
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Europe/Belgrade")
 BOOKING_SLOT_MINUTES = 10
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 app = Flask(__name__, instance_relative_config=True)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-secret-key")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+_secret_key = os.environ.get("SECRET_KEY", "").strip()
+if not _secret_key:
+    if os.environ.get("RENDER"):
+        raise RuntimeError("SECRET_KEY nije podesen. Dodaj jaku nasumicnu vrednost u Render Environment.")
+    _secret_key = secrets.token_urlsafe(48)
+app.config.update(
+    SECRET_KEY=_secret_key,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+)
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "5"))
+LOGIN_WINDOW_MINUTES = int(os.environ.get("LOGIN_WINDOW_MINUTES", "15"))
+BOOKING_MAX_REQUESTS = int(os.environ.get("BOOKING_MAX_REQUESTS", "8"))
+BOOKING_WINDOW_MINUTES = int(os.environ.get("BOOKING_WINDOW_MINUTES", "30"))
+WEEKDAYS = [
+    (0, "Ponedeljak", "Pon"),
+    (1, "Utorak", "Uto"),
+    (2, "Sreda", "Sre"),
+    (3, "Cetvrtak", "Cet"),
+    (4, "Petak", "Pet"),
+    (5, "Subota", "Sub"),
+    (6, "Nedelja", "Ned"),
+]
 
 STATUS_LABELS = {
     "pending": "Na cekanju",
@@ -62,9 +98,9 @@ SUBSCRIPTION_LABELS = {
 }
 
 PLAN_LABELS = {
-    "trial": "Trial",
-    "monthly": "10 EUR / mesec",
-    "yearly": "80 EUR / godina",
+    "trial": "Probni period",
+    "monthly": f"{MONTHLY_PRICE_EUR:.2f} EUR / mesec".replace(".", ","),
+    "yearly": f"{YEARLY_PRICE_EUR:.2f} EUR / godina".replace(".", ","),
     "free": "Besplatno",
 }
 
@@ -268,7 +304,8 @@ def init_db():
         source TEXT NOT NULL DEFAULT 'admin',
         notes TEXT,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        public_token TEXT
     );
 
     CREATE TABLE IF NOT EXISTS subscription_events (
@@ -280,11 +317,76 @@ def init_db():
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS salon_working_hours (
+        salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
+        weekday SMALLINT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+        is_open BOOLEAN NOT NULL DEFAULT TRUE,
+        open_time TIME,
+        close_time TIME,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (salon_id, weekday)
+    );
+
+    CREATE TABLE IF NOT EXISTS worker_working_hours (
+        worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+        weekday SMALLINT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+        mode TEXT NOT NULL DEFAULT 'inherit' CHECK (mode IN ('inherit', 'custom', 'off')),
+        open_time TIME,
+        close_time TIME,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (worker_id, weekday)
+    );
+
+    CREATE TABLE IF NOT EXISTS worker_breaks (
+        worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+        weekday SMALLINT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+        start_time TIME NOT NULL,
+        end_time TIME NOT NULL,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (worker_id, weekday),
+        CHECK (end_time > start_time)
+    );
+
+    CREATE TABLE IF NOT EXISTS login_attempts (
+        id BIGSERIAL PRIMARY KEY,
+        email TEXT NOT NULL DEFAULT '',
+        ip_address TEXT NOT NULL DEFAULT '',
+        successful BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS booking_attempts (
+        id BIGSERIAL PRIMARY KEY,
+        salon_id INTEGER REFERENCES salons(id) ON DELETE CASCADE,
+        ip_address TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS email_events (
+        id BIGSERIAL PRIMARY KEY,
+        salon_id INTEGER REFERENCES salons(id) ON DELETE CASCADE,
+        appointment_id INTEGER REFERENCES appointments(id) ON DELETE CASCADE,
+        event_key TEXT NOT NULL,
+        recipient TEXT DEFAULT '',
+        successful BOOLEAN NOT NULL DEFAULT FALSE,
+        error_message TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (appointment_id, event_key)
+    );
+
     ALTER TABLE salons ADD COLUMN IF NOT EXISTS booking_mode TEXT NOT NULL DEFAULT 'manual';
     ALTER TABLE salons ALTER COLUMN slot_minutes SET DEFAULT 10;
     ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP;
+    ALTER TABLE clients ADD COLUMN IF NOT EXISTS privacy_consent_at TIMESTAMP;
+    ALTER TABLE clients ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE salons ADD COLUMN IF NOT EXISTS booking_min_notice_minutes INTEGER NOT NULL DEFAULT 120;
+    ALTER TABLE salons ADD COLUMN IF NOT EXISTS booking_max_days INTEGER NOT NULL DEFAULT 90;
+    ALTER TABLE salons ADD COLUMN IF NOT EXISTS cancellation_notice_hours INTEGER NOT NULL DEFAULT 24;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS worker_id INTEGER REFERENCES workers(id) ON DELETE RESTRICT;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 30;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS public_token TEXT;
 
     UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
     UPDATE appointments a
@@ -299,14 +401,19 @@ def init_db():
     CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_one_default ON workers(salon_id) WHERE is_default = TRUE;
     CREATE INDEX IF NOT EXISTS idx_worker_services_service_id ON worker_services(service_id);
     CREATE INDEX IF NOT EXISTS idx_worker_time_off_lookup ON worker_time_off(worker_id, start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup ON login_attempts(email, ip_address, created_at);
+    CREATE INDEX IF NOT EXISTS idx_booking_attempts_lookup ON booking_attempts(salon_id, ip_address, created_at);
+    CREATE INDEX IF NOT EXISTS idx_email_events_appointment ON email_events(appointment_id, event_key);
     CREATE INDEX IF NOT EXISTS idx_appointments_salon_date ON appointments(salon_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_worker_date ON appointments(worker_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_appointments_public_token ON appointments(public_token) WHERE public_token IS NOT NULL;
     """
     with get_db().cursor() as cur:
         cur.execute(schema)
     get_db().commit()
     ensure_default_workers()
+    ensure_all_working_hours()
     seed_super_admin()
 
 
@@ -324,7 +431,7 @@ def seed_super_admin():
         db_execute(
             """
             UPDATE users
-            SET role = 'super_admin', salon_id = NULL, password_hash = %s, active = TRUE, name = %s
+            SET role = 'super_admin', salon_id = NULL, password_hash = %s, active = TRUE, email_verified = TRUE, email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP), name = %s
             WHERE id = %s
             """,
             (password_hash, name, existing["id"]),
@@ -332,8 +439,8 @@ def seed_super_admin():
     else:
         db_execute(
             """
-            INSERT INTO users (salon_id, role, name, email, password_hash, active)
-            VALUES (NULL, 'super_admin', %s, %s, %s, TRUE)
+            INSERT INTO users (salon_id, role, name, email, password_hash, active, email_verified, email_verified_at)
+            VALUES (NULL, 'super_admin', %s, %s, %s, TRUE, TRUE, CURRENT_TIMESTAMP)
             """,
             (name, email, password_hash),
         )
@@ -423,6 +530,273 @@ def ensure_default_workers():
         ensure_salon_default_worker(salon["id"])
 
 
+def seed_salon_working_hours(salon):
+    salon_id = salon["id"]
+    existing = db_query("SELECT COUNT(*) AS total FROM salon_working_hours WHERE salon_id = %s", (salon_id,), one=True)
+    if existing and existing["total"] >= 7:
+        return
+    default_open = salon.get("open_time") or DEFAULT_SALON_SETTINGS["open_time"]
+    default_close = salon.get("close_time") or DEFAULT_SALON_SETTINGS["close_time"]
+    rows = []
+    for weekday, _, _ in WEEKDAYS:
+        is_open = weekday < 6
+        close_value = "16:00" if weekday == 5 else default_close
+        rows.append((salon_id, weekday, is_open, default_open if is_open else None, close_value if is_open else None, datetime.now()))
+    db_execute_many(
+        """
+        INSERT INTO salon_working_hours (salon_id, weekday, is_open, open_time, close_time, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (salon_id, weekday) DO NOTHING
+        """,
+        rows,
+    )
+
+
+def seed_worker_working_hours(worker_id):
+    rows = [(worker_id, weekday, "inherit", None, None, datetime.now()) for weekday, _, _ in WEEKDAYS]
+    db_execute_many(
+        """
+        INSERT INTO worker_working_hours (worker_id, weekday, mode, open_time, close_time, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (worker_id, weekday) DO NOTHING
+        """,
+        rows,
+    )
+
+
+def ensure_all_working_hours():
+    for salon in db_query("SELECT * FROM salons ORDER BY id"):
+        seed_salon_working_hours(salon)
+    for worker in db_query("SELECT id FROM workers ORDER BY id"):
+        seed_worker_working_hours(worker["id"])
+
+
+def salon_working_hours_rows(salon_id):
+    rows = db_query(
+        "SELECT weekday, is_open, open_time, close_time FROM salon_working_hours WHERE salon_id = %s ORDER BY weekday",
+        (salon_id,),
+    )
+    by_day = {int(row["weekday"]): row for row in rows}
+    return [
+        {
+            "weekday": weekday,
+            "name": name,
+            "short": short,
+            "is_open": bool(by_day.get(weekday, {}).get("is_open", weekday < 6)),
+            "open_time": by_day.get(weekday, {}).get("open_time") or time(9, 0),
+            "close_time": by_day.get(weekday, {}).get("close_time") or time(20, 0),
+        }
+        for weekday, name, short in WEEKDAYS
+    ]
+
+
+def format_working_hours_summary(rows):
+    parts = []
+    for row in rows:
+        if not row["is_open"]:
+            continue
+        parts.append(f"{row['short']} {time_short(row['open_time'])}-{time_short(row['close_time'])}")
+    return ", ".join(parts) or "Zatvoreno"
+
+
+def worker_schedule_rows(worker_id):
+    schedule_rows = db_query(
+        "SELECT weekday, mode, open_time, close_time FROM worker_working_hours WHERE worker_id = %s ORDER BY weekday",
+        (worker_id,),
+    )
+    break_rows = db_query(
+        "SELECT weekday, start_time, end_time FROM worker_breaks WHERE worker_id = %s ORDER BY weekday",
+        (worker_id,),
+    )
+    schedule = {int(row["weekday"]): row for row in schedule_rows}
+    breaks = {int(row["weekday"]): row for row in break_rows}
+    return [
+        {
+            "weekday": weekday,
+            "name": name,
+            "short": short,
+            "mode": schedule.get(weekday, {}).get("mode", "inherit"),
+            "open_time": schedule.get(weekday, {}).get("open_time") or time(9, 0),
+            "close_time": schedule.get(weekday, {}).get("close_time") or time(20, 0),
+            "break_start": breaks.get(weekday, {}).get("start_time"),
+            "break_end": breaks.get(weekday, {}).get("end_time"),
+        }
+        for weekday, name, short in WEEKDAYS
+    ]
+
+
+def effective_worker_hours(salon_id, worker_id, selected_date, cursor=None):
+    selected_date = parse_iso_date(selected_date)
+    if not selected_date:
+        return None
+    weekday = selected_date.weekday()
+    salon_day = query_rows(
+        "SELECT * FROM salon_working_hours WHERE salon_id = %s AND weekday = %s",
+        (salon_id, weekday),
+        one=True,
+        cursor=cursor,
+    )
+    if not salon_day or not salon_day["is_open"]:
+        return None
+    salon_open = time_to_minutes(salon_day.get("open_time"))
+    salon_close = time_to_minutes(salon_day.get("close_time"))
+    if salon_open is None or salon_close is None or salon_close <= salon_open:
+        return None
+
+    worker_day = query_rows(
+        "SELECT * FROM worker_working_hours WHERE worker_id = %s AND weekday = %s",
+        (worker_id, weekday),
+        one=True,
+        cursor=cursor,
+    )
+    mode = worker_day.get("mode") if worker_day else "inherit"
+    if mode == "off":
+        return None
+    if mode == "custom":
+        worker_open = time_to_minutes(worker_day.get("open_time"))
+        worker_close = time_to_minutes(worker_day.get("close_time"))
+        if worker_open is None or worker_close is None:
+            return None
+        open_minutes = max(salon_open, worker_open)
+        close_minutes = min(salon_close, worker_close)
+    else:
+        open_minutes, close_minutes = salon_open, salon_close
+    if close_minutes <= open_minutes:
+        return None
+
+    breaks = query_rows(
+        "SELECT start_time, end_time FROM worker_breaks WHERE worker_id = %s AND weekday = %s",
+        (worker_id, weekday),
+        cursor=cursor,
+    )
+    break_ranges = []
+    for row in breaks:
+        start = time_to_minutes(row.get("start_time"))
+        end = time_to_minutes(row.get("end_time"))
+        if start is not None and end is not None and end > start:
+            break_ranges.append((start, end))
+    return {"open": open_minutes, "close": close_minutes, "breaks": break_ranges}
+
+
+def external_url(endpoint, **values):
+    path = url_for(endpoint, **values)
+    if APP_BASE_URL:
+        return APP_BASE_URL + path
+    return url_for(endpoint, _external=True, **values)
+
+
+def token_serializer():
+    return URLSafeTimedSerializer(app.config["SECRET_KEY"])
+
+
+def create_signed_token(purpose, user):
+    payload = {"purpose": purpose, "user_id": user["id"], "email": user["email"]}
+    if purpose == "reset-password":
+        payload["password_hash"] = user.get("password_hash")
+    return token_serializer().dumps(payload, salt=f"salonpanel-{purpose}")
+
+
+def read_signed_token(token, purpose, max_age):
+    try:
+        data = token_serializer().loads(token, salt=f"salonpanel-{purpose}", max_age=max_age)
+    except (SignatureExpired, BadSignature):
+        return None
+    if data.get("purpose") != purpose:
+        return None
+    return data
+
+
+def valid_email(value):
+    value = (value or "").strip()
+    return bool(value and len(value) <= 254 and EMAIL_PATTERN.fullmatch(value))
+
+
+def request_ip():
+    # ProxyFix above converts the trusted Render proxy header into remote_addr.
+    # Reading X-Forwarded-For directly would allow a client to spoof a different IP.
+    return (request.remote_addr or "")[:80]
+
+
+def login_is_rate_limited(email, ip_address):
+    cutoff = datetime.now() - timedelta(minutes=LOGIN_WINDOW_MINUTES)
+    row = db_query(
+        """
+        SELECT COUNT(*) AS total FROM login_attempts
+        WHERE successful = FALSE AND created_at >= %s AND ip_address = %s
+        """,
+        (cutoff, ip_address),
+        one=True,
+    )
+    return bool(row and row["total"] >= LOGIN_MAX_ATTEMPTS)
+
+
+def record_login_attempt(email, ip_address, successful):
+    cutoff = datetime.now() - timedelta(days=2)
+    db_execute("DELETE FROM login_attempts WHERE created_at < %s", (cutoff,))
+    db_execute(
+        "INSERT INTO login_attempts (email, ip_address, successful, created_at) VALUES (%s, %s, %s, %s)",
+        (email, ip_address, successful, datetime.now()),
+    )
+    if successful:
+        db_execute("DELETE FROM login_attempts WHERE LOWER(email) = LOWER(%s) AND successful = FALSE", (email,))
+
+
+def booking_is_rate_limited(salon_id, ip_address):
+    cutoff = datetime.now() - timedelta(minutes=BOOKING_WINDOW_MINUTES)
+    row = db_query(
+        """
+        SELECT COUNT(*) AS total FROM booking_attempts
+        WHERE salon_id = %s AND ip_address = %s AND created_at >= %s
+        """,
+        (salon_id, ip_address, cutoff),
+        one=True,
+    )
+    return bool(row and row["total"] >= BOOKING_MAX_REQUESTS)
+
+
+def record_booking_attempt(salon_id, ip_address):
+    cutoff = datetime.now() - timedelta(days=2)
+    db_execute("DELETE FROM booking_attempts WHERE created_at < %s", (cutoff,))
+    db_execute(
+        "INSERT INTO booking_attempts (salon_id, ip_address, created_at) VALUES (%s, %s, %s)",
+        (salon_id, ip_address, datetime.now()),
+    )
+
+
+def csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+@app.before_request
+def protect_csrf():
+    if request.endpoint == "send_reminders_task":
+        return None
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        expected = session.get("csrf_token")
+        supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token")
+        if not expected or not supplied or not secrets.compare_digest(str(expected), str(supplied)):
+            return render_template("csrf_error.html"), 400
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.is_secure:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if session.get("user_id") or request.endpoint in {
+        "booking_success", "login", "register", "forgot_password", "reset_password"
+    }:
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
 def current_user():
     user_id = session.get("user_id")
     if not user_id:
@@ -445,7 +819,9 @@ def salon_settings(salon):
     if not salon:
         settings = dict(DEFAULT_SALON_SETTINGS)
         settings["business_name"] = APP_NAME
+        settings.update({"booking_min_notice_minutes": 120, "booking_max_days": 90, "cancellation_notice_hours": 24})
         return settings
+    hours_rows = salon_working_hours_rows(salon["id"])
     return {
         "business_name": salon["name"],
         "business_type": salon["business_type"] or DEFAULT_SALON_SETTINGS["business_type"],
@@ -453,12 +829,15 @@ def salon_settings(salon):
         "whatsapp": salon["whatsapp"] or "",
         "instagram": salon["instagram"] or "",
         "address": salon["address"] or "",
-        "working_hours": salon["working_hours"] or "",
+        "working_hours": format_working_hours_summary(hours_rows),
         "booking_note": salon["booking_note"] or DEFAULT_SALON_SETTINGS["booking_note"],
         "open_time": salon["open_time"] or DEFAULT_SALON_SETTINGS["open_time"],
         "close_time": salon["close_time"] or DEFAULT_SALON_SETTINGS["close_time"],
         "slot_minutes": BOOKING_SLOT_MINUTES,
         "booking_mode": salon.get("booking_mode") or DEFAULT_SALON_SETTINGS["booking_mode"],
+        "booking_min_notice_minutes": int(salon.get("booking_min_notice_minutes") or 120),
+        "booking_max_days": int(salon.get("booking_max_days") or 90),
+        "cancellation_notice_hours": int(salon.get("cancellation_notice_hours") or 24),
     }
 
 
@@ -505,6 +884,10 @@ def inject_globals():
         "today_iso": local_today().isoformat(),
         "monthly_price_eur": MONTHLY_PRICE_EUR,
         "yearly_price_eur": YEARLY_PRICE_EUR,
+        "trial_days": TRIAL_DAYS,
+        "weekdays": WEEKDAYS,
+        "csrf_token": csrf_token,
+        "email_is_configured": email_is_configured(),
     }
 
 
@@ -524,7 +907,8 @@ def euro(value):
         amount = float(value or 0)
     except (TypeError, ValueError):
         amount = 0
-    return f"{amount:,.0f} EUR".replace(",", ".")
+    text = f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{text} EUR"
 
 
 @app.template_filter("date_sr")
@@ -532,13 +916,27 @@ def date_sr(value):
     if not value:
         return "-"
     if isinstance(value, datetime):
-        return value.strftime("%d.%m.%Y")
+        return value.strftime("%d.%m.%Y.")
     if isinstance(value, date):
-        return value.strftime("%d.%m.%Y")
+        return value.strftime("%d.%m.%Y.")
     try:
-        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d.%m.%Y")
+        return datetime.strptime(str(value), "%Y-%m-%d").strftime("%d.%m.%Y.")
     except ValueError:
         return str(value)
+
+
+
+
+@app.template_filter("date_input")
+def date_input_filter(value):
+    return date_input_value(value)
+
+@app.template_filter("minutes_time")
+def minutes_time_filter(value):
+    try:
+        return minutes_to_time(int(value))
+    except (TypeError, ValueError):
+        return "-"
 
 
 @app.template_filter("time_short")
@@ -641,11 +1039,12 @@ def parse_price(value, fallback=0):
         return float(fallback or 0)
 
 
-def get_or_create_client(salon_id, name, phone=None, email=None, notes=None):
+def get_or_create_client(salon_id, name, phone=None, email=None, notes=None, privacy_consent=False, marketing_consent=False):
     name = (name or "").strip()
     phone = (phone or "").strip()
-    email = (email or "").strip()
+    email = (email or "").strip().lower()
     notes = (notes or "").strip()
+    consent_at = datetime.now() if privacy_consent else None
 
     if phone:
         existing = db_query(
@@ -655,8 +1054,15 @@ def get_or_create_client(salon_id, name, phone=None, email=None, notes=None):
         )
         if existing:
             db_execute(
-                "UPDATE clients SET name = COALESCE(NULLIF(%s, ''), name), email = COALESCE(NULLIF(%s, ''), email) WHERE id = %s AND salon_id = %s",
-                (name, email, existing["id"], salon_id),
+                """
+                UPDATE clients
+                SET name = COALESCE(NULLIF(%s, ''), name),
+                    email = COALESCE(NULLIF(%s, ''), email),
+                    privacy_consent_at = COALESCE(privacy_consent_at, %s),
+                    marketing_consent = marketing_consent OR %s
+                WHERE id = %s AND salon_id = %s
+                """,
+                (name, email, consent_at, marketing_consent, existing["id"], salon_id),
             )
             return existing["id"]
 
@@ -667,18 +1073,25 @@ def get_or_create_client(salon_id, name, phone=None, email=None, notes=None):
     )
     if existing_by_name:
         db_execute(
-            "UPDATE clients SET phone = COALESCE(NULLIF(%s, ''), phone), email = COALESCE(NULLIF(%s, ''), email) WHERE id = %s AND salon_id = %s",
-            (phone, email, existing_by_name["id"], salon_id),
+            """
+            UPDATE clients
+            SET phone = COALESCE(NULLIF(%s, ''), phone),
+                email = COALESCE(NULLIF(%s, ''), email),
+                privacy_consent_at = COALESCE(privacy_consent_at, %s),
+                marketing_consent = marketing_consent OR %s
+            WHERE id = %s AND salon_id = %s
+            """,
+            (phone, email, consent_at, marketing_consent, existing_by_name["id"], salon_id),
         )
         return existing_by_name["id"]
 
     row = db_execute(
         """
-        INSERT INTO clients (salon_id, name, phone, email, notes)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO clients (salon_id, name, phone, email, notes, privacy_consent_at, marketing_consent)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (salon_id, name, phone, email, notes),
+        (salon_id, name, phone, email, notes, consent_at, marketing_consent),
         returning=True,
     )
     return row["id"]
@@ -699,10 +1112,18 @@ def parse_iso_date(value):
         return value.date()
     if isinstance(value, date):
         return value
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        return None
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%Y.", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def date_input_value(value):
+    parsed = parse_iso_date(value)
+    return parsed.strftime("%d.%m.%Y.") if parsed else ""
 
 
 def time_to_minutes(value):
@@ -845,20 +1266,26 @@ def appointment_availability_error(
     if start_minutes % BOOKING_SLOT_MINUTES != 0:
         return "Termin mora poceti na punih 10 minuta."
 
-    open_minutes = time_to_minutes(salon.get("open_time"))
-    close_minutes = time_to_minutes(salon.get("close_time"))
+    schedule = effective_worker_hours(salon["id"], worker_id, selected_date, cursor=cursor)
+    if not schedule:
+        return "Radnik ne radi izabranog dana."
     end_minutes = start_minutes + duration_minutes
-    if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
-        return "Radno vreme salona nije pravilno podeseno."
-    if start_minutes < open_minutes or end_minutes > close_minutes:
-        return "Izabrana usluga ne staje u radno vreme salona."
+    if start_minutes < schedule["open"] or end_minutes > schedule["close"]:
+        return "Izabrana usluga ne staje u radno vreme radnika."
+    if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in schedule["breaks"]):
+        return "Izabrano vreme se preklapa sa pauzom radnika."
 
     if public_request:
         now = local_now()
-        if selected_date < now.date():
-            return "Izaberite danasnji ili buduci datum."
-        if selected_date == now.date() and start_minutes <= now.hour * 60 + now.minute:
+        selected_start = datetime.combine(selected_date, time(start_minutes // 60, start_minutes % 60), tzinfo=now.tzinfo)
+        min_notice = int(salon.get("booking_min_notice_minutes") or 120)
+        max_days = int(salon.get("booking_max_days") or 90)
+        if selected_start <= now:
             return "Izabrano vreme je vec proslo."
+        if selected_start < now + timedelta(minutes=min_notice):
+            return f"Termin je moguce zakazati najmanje {min_notice} minuta unapred."
+        if selected_date > now.date() + timedelta(days=max_days):
+            return f"Termin je moguce zakazati najvise {max_days} dana unapred."
 
     if worker is None:
         worker = query_rows(
@@ -896,23 +1323,30 @@ def appointment_availability_error(
         return f"Radnik vec ima aktivan termin za klijenta {conflict['client_name']} u tom periodu."
     return None
 
-
 def available_slots_for_worker(salon, worker_id, service_id, appointment_date):
     selected_date = parse_iso_date(appointment_date)
     if not selected_date:
         return None, "Datum nije ispravan."
     if selected_date < local_today():
         return None, "Izaberite danasnji ili buduci datum."
+    max_days = int(salon.get("booking_max_days") or 90)
+    if selected_date > local_today() + timedelta(days=max_days):
+        return None, f"Termin je moguce zakazati najvise {max_days} dana unapred."
 
     assignment = worker_service_assignment(salon["id"], worker_id, service_id, active_only=True)
     if not assignment:
         return None, "Izabrani radnik ne pruza ovu uslugu."
 
     duration_minutes = int(assignment["worker_duration_minutes"] or 0)
-    open_minutes = time_to_minutes(salon["open_time"])
-    close_minutes = time_to_minutes(salon["close_time"])
-    if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
-        return None, "Radno vreme salona nije pravilno podeseno."
+    schedule = effective_worker_hours(salon["id"], worker_id, selected_date)
+    if not schedule:
+        return {
+            "slots": [],
+            "price": float(assignment["worker_price"] or 0),
+            "duration_minutes": duration_minutes,
+            "worker_name": assignment["worker_name"],
+            "service_name": assignment["service_name"],
+        }, None
 
     appointments = db_query(
         """
@@ -936,26 +1370,28 @@ def available_slots_for_worker(salon, worker_id, service_id, appointment_date):
         row_start = time_to_minutes(row["time"])
         appointment_ranges.append((row_start, row_start + int(row.get("duration_minutes") or 30)))
 
-    absence_ranges = []
+    blocked_ranges = list(schedule["breaks"])
     all_day_absence = False
     for row in absences:
         if row["all_day"] or row.get("start_time") is None or row.get("end_time") is None:
             all_day_absence = True
             break
-        absence_ranges.append((time_to_minutes(row["start_time"]), time_to_minutes(row["end_time"])))
+        blocked_ranges.append((time_to_minutes(row["start_time"]), time_to_minutes(row["end_time"])))
 
     slots = []
     if not all_day_absence:
-        first_slot = ((open_minutes + BOOKING_SLOT_MINUTES - 1) // BOOKING_SLOT_MINUTES) * BOOKING_SLOT_MINUTES
+        first_slot = ((schedule["open"] + BOOKING_SLOT_MINUTES - 1) // BOOKING_SLOT_MINUTES) * BOOKING_SLOT_MINUTES
         now = local_now()
-        current_minutes = now.hour * 60 + now.minute if selected_date == now.date() else None
-        for start_minutes in range(first_slot, close_minutes - duration_minutes + 1, BOOKING_SLOT_MINUTES):
+        min_notice = int(salon.get("booking_min_notice_minutes") or 120)
+        earliest = now + timedelta(minutes=min_notice)
+        for start_minutes in range(first_slot, schedule["close"] - duration_minutes + 1, BOOKING_SLOT_MINUTES):
             end_minutes = start_minutes + duration_minutes
-            if current_minutes is not None and start_minutes <= current_minutes:
+            selected_start = datetime.combine(selected_date, time(start_minutes // 60, start_minutes % 60), tzinfo=now.tzinfo)
+            if selected_start < earliest:
                 continue
             if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in appointment_ranges):
                 continue
-            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in absence_ranges):
+            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in blocked_ranges):
                 continue
             slots.append(minutes_to_time(start_minutes))
 
@@ -967,36 +1403,28 @@ def available_slots_for_worker(salon, worker_id, service_id, appointment_date):
         "service_name": assignment["service_name"],
     }, None
 
-
-
 def available_dates_for_worker(salon, worker_id, service_id, start_date=None, days=90):
     selected_start = parse_iso_date(start_date) or local_today()
     if selected_start < local_today():
         selected_start = local_today()
 
     try:
-        days = max(1, min(int(days), 180))
+        requested_days = max(1, min(int(days), 180))
     except (TypeError, ValueError):
-        days = 90
-    selected_end = selected_start + timedelta(days=days - 1)
+        requested_days = 90
+    max_days = int(salon.get("booking_max_days") or 90)
+    latest_allowed = local_today() + timedelta(days=max_days)
+    if selected_start > latest_allowed:
+        return None, f"Termin je moguce zakazati najvise {max_days} dana unapred."
+    requested_days = min(requested_days, (latest_allowed - selected_start).days + 1)
+    selected_end = selected_start + timedelta(days=requested_days - 1)
 
     assignment = worker_service_assignment(salon["id"], worker_id, service_id, active_only=True)
     if not assignment:
         return None, "Izabrani radnik ne pruza ovu uslugu."
-
     duration_minutes = int(assignment["worker_duration_minutes"] or 0)
-    open_minutes = time_to_minutes(salon["open_time"])
-    close_minutes = time_to_minutes(salon["close_time"])
-    if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
-        return None, "Radno vreme salona nije pravilno podeseno."
-    if duration_minutes <= 0 or duration_minutes > close_minutes - open_minutes:
-        return {
-            "dates": [],
-            "price": float(assignment["worker_price"] or 0),
-            "duration_minutes": duration_minutes,
-            "worker_name": assignment["worker_name"],
-            "service_name": assignment["service_name"],
-        }, None
+    if duration_minutes <= 0:
+        return None, "Trajanje usluge nije ispravno."
 
     appointment_rows = db_query(
         """
@@ -1019,66 +1447,107 @@ def available_dates_for_worker(salon, worker_id, service_id, start_date=None, da
         """,
         (salon["id"], worker_id, selected_end, selected_start),
     )
+    salon_hours_rows = db_query(
+        "SELECT weekday, is_open, open_time, close_time FROM salon_working_hours WHERE salon_id = %s",
+        (salon["id"],),
+    )
+    worker_hours_rows = db_query(
+        "SELECT weekday, mode, open_time, close_time FROM worker_working_hours WHERE worker_id = %s",
+        (worker_id,),
+    )
+    break_rows = db_query(
+        "SELECT weekday, start_time, end_time FROM worker_breaks WHERE worker_id = %s",
+        (worker_id,),
+    )
+
+    salon_hours = {int(row["weekday"]): row for row in salon_hours_rows}
+    worker_hours = {int(row["weekday"]): row for row in worker_hours_rows}
+    breaks_by_weekday = {}
+    for row in break_rows:
+        start = time_to_minutes(row.get("start_time"))
+        end = time_to_minutes(row.get("end_time"))
+        if start is not None and end is not None and end > start:
+            breaks_by_weekday.setdefault(int(row["weekday"]), []).append((start, end))
 
     appointments_by_date = {}
     for row in appointment_rows:
         row_date = parse_iso_date(row["date"])
         row_start = time_to_minutes(row["time"])
-        if not row_date or row_start is None:
-            continue
-        appointments_by_date.setdefault(row_date, []).append(
-            (row_start, row_start + int(row.get("duration_minutes") or 30))
-        )
+        if row_date and row_start is not None:
+            appointments_by_date.setdefault(row_date, []).append(
+                (row_start, row_start + int(row.get("duration_minutes") or 30))
+            )
 
     normalized_absences = []
     for row in absence_rows:
-        absence_start_date = parse_iso_date(row["start_date"])
-        absence_end_date = parse_iso_date(row["end_date"])
-        if not absence_start_date or not absence_end_date:
-            continue
-        normalized_absences.append(
-            {
-                "start_date": absence_start_date,
-                "end_date": absence_end_date,
+        start_day = parse_iso_date(row["start_date"])
+        end_day = parse_iso_date(row["end_date"])
+        if start_day and end_day:
+            normalized_absences.append({
+                "start_date": start_day,
+                "end_date": end_day,
                 "start_time": time_to_minutes(row.get("start_time")),
                 "end_time": time_to_minutes(row.get("end_time")),
                 "all_day": bool(row["all_day"]),
-            }
-        )
+            })
 
-    first_slot = ((open_minutes + BOOKING_SLOT_MINUTES - 1) // BOOKING_SLOT_MINUTES) * BOOKING_SLOT_MINUTES
     now = local_now()
+    earliest = now + timedelta(minutes=int(salon.get("booking_min_notice_minutes") or 120))
     available_dates = []
-
-    for offset in range(days):
+    for offset in range(requested_days):
         current_date = selected_start + timedelta(days=offset)
-        current_minutes = now.hour * 60 + now.minute if current_date == now.date() else None
-        appointment_ranges = appointments_by_date.get(current_date, [])
-        absence_ranges = []
-        all_day_absence = False
+        weekday = current_date.weekday()
+        salon_day = salon_hours.get(weekday)
+        if not salon_day or not salon_day["is_open"]:
+            continue
+        open_minutes = time_to_minutes(salon_day.get("open_time"))
+        close_minutes = time_to_minutes(salon_day.get("close_time"))
+        if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+            continue
 
+        worker_day = worker_hours.get(weekday)
+        mode = worker_day.get("mode") if worker_day else "inherit"
+        if mode == "off":
+            continue
+        if mode == "custom":
+            worker_open = time_to_minutes(worker_day.get("open_time"))
+            worker_close = time_to_minutes(worker_day.get("close_time"))
+            if worker_open is None or worker_close is None:
+                continue
+            open_minutes = max(open_minutes, worker_open)
+            close_minutes = min(close_minutes, worker_close)
+        if close_minutes <= open_minutes or duration_minutes > close_minutes - open_minutes:
+            continue
+
+        blocked_ranges = list(breaks_by_weekday.get(weekday, []))
+        all_day_absence = False
         for absence in normalized_absences:
             if not (absence["start_date"] <= current_date <= absence["end_date"]):
                 continue
             if absence["all_day"] or absence["start_time"] is None or absence["end_time"] is None:
                 all_day_absence = True
                 break
-            absence_ranges.append((absence["start_time"], absence["end_time"]))
-
+            blocked_ranges.append((absence["start_time"], absence["end_time"]))
         if all_day_absence:
             continue
 
+        appointment_ranges = appointments_by_date.get(current_date, [])
+        first_slot = ((open_minutes + BOOKING_SLOT_MINUTES - 1) // BOOKING_SLOT_MINUTES) * BOOKING_SLOT_MINUTES
         slots_count = 0
         for start_minutes in range(first_slot, close_minutes - duration_minutes + 1, BOOKING_SLOT_MINUTES):
             end_minutes = start_minutes + duration_minutes
-            if current_minutes is not None and start_minutes <= current_minutes:
+            selected_start_dt = datetime.combine(
+                current_date,
+                time(start_minutes // 60, start_minutes % 60),
+                tzinfo=now.tzinfo,
+            )
+            if selected_start_dt < earliest:
                 continue
             if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in appointment_ranges):
                 continue
-            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in absence_ranges):
+            if any(intervals_overlap(start_minutes, end_minutes, item[0], item[1]) for item in blocked_ranges):
                 continue
             slots_count += 1
-
         if slots_count:
             available_dates.append({"date": current_date.isoformat(), "slots_count": slots_count})
 
@@ -1089,7 +1558,6 @@ def available_dates_for_worker(salon, worker_id, service_id, start_date=None, da
         "worker_name": assignment["worker_name"],
         "service_name": assignment["service_name"],
     }, None
-
 
 def persist_appointment_locked(
     salon,
@@ -1105,6 +1573,7 @@ def persist_appointment_locked(
     notes,
     appointment_id=None,
     public_request=False,
+    public_token=None,
 ):
     connection = get_db()
     try:
@@ -1175,8 +1644,8 @@ def persist_appointment_locked(
                     """
                     INSERT INTO appointments
                         (salon_id, client_id, service_id, worker_id, date, time, duration_minutes,
-                         price, status, source, notes, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         price, status, source, notes, created_at, updated_at, public_token)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -1193,6 +1662,7 @@ def persist_appointment_locked(
                         notes,
                         now,
                         now,
+                        public_token,
                     ),
                 )
             row = cur.fetchone()
@@ -1223,9 +1693,17 @@ def login():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
+        ip_address = request_ip()
+        if login_is_rate_limited(email, ip_address):
+            flash(f"Previse neuspesnih pokusaja. Pokusajte ponovo za {LOGIN_WINDOW_MINUTES} minuta.", "error")
+            return render_template("login.html"), 429
+
         user = db_query("SELECT * FROM users WHERE LOWER(email) = LOWER(%s) AND active = TRUE", (email,), one=True)
-        if user and check_password_hash(user["password_hash"], password):
+        successful = bool(user and check_password_hash(user["password_hash"], password))
+        record_login_attempt(email, ip_address, successful)
+        if successful:
             session.clear()
+            session.permanent = True
             session["user_id"] = user["id"]
             session["user_role"] = user["role"]
             session["salon_id"] = user["salon_id"]
@@ -1239,6 +1717,16 @@ def login():
     return render_template("login.html")
 
 
+def send_verification_for_user(user):
+    token = create_signed_token("verify-email", user)
+    return send_auth_email(
+        user["email"],
+        user["name"],
+        external_url("verify_email", token=token),
+        "verify",
+    )
+
+
 @app.route("/register", methods=["GET", "POST"])
 def register():
     creator = current_user()
@@ -1248,14 +1736,25 @@ def register():
         owner_name = request.form.get("owner_name", "").strip()
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
+        password_confirm = request.form.get("password_confirm", "")
         phone = request.form.get("phone", "").strip()
         business_type = request.form.get("business_type", DEFAULT_SALON_SETTINGS["business_type"]).strip()
+        privacy_accepted = request.form.get("privacy_accepted") == "on"
 
         if not salon_name or not owner_name or not email or not password:
             flash("Popunite naziv salona, ime vlasnika, email i sifru.", "error")
             return render_template("register.html")
+        if not valid_email(email):
+            flash("Unesite ispravnu email adresu.", "error")
+            return render_template("register.html")
         if len(password) < 8:
             flash("Sifra mora imati najmanje 8 karaktera.", "error")
+            return render_template("register.html")
+        if password != password_confirm:
+            flash("Sifre se ne podudaraju.", "error")
+            return render_template("register.html")
+        if not privacy_accepted and not creator_is_super_admin:
+            flash("Morate prihvatiti Uslove koriscenja i Politiku privatnosti.", "error")
             return render_template("register.html")
         if db_query("SELECT id FROM users WHERE LOWER(email) = LOWER(%s)", (email,), one=True):
             flash("Vec postoji nalog sa tim emailom.", "error")
@@ -1293,26 +1792,102 @@ def register():
         salon_id = salon_row["id"]
         user_row = db_execute(
             """
-            INSERT INTO users (salon_id, role, name, email, password_hash, active)
-            VALUES (%s, 'owner', %s, %s, %s, TRUE)
-            RETURNING id
+            INSERT INTO users (salon_id, role, name, email, password_hash, active, email_verified)
+            VALUES (%s, 'owner', %s, %s, %s, TRUE, FALSE)
+            RETURNING *
             """,
             (salon_id, owner_name, email, generate_password_hash(password)),
             returning=True,
         )
         create_default_services(salon_id)
-        ensure_salon_default_worker(salon_id)
+        worker_id = ensure_salon_default_worker(salon_id)
+        seed_salon_working_hours(db_query("SELECT * FROM salons WHERE id = %s", (salon_id,), one=True))
+        if worker_id:
+            seed_worker_working_hours(worker_id)
+        sent, email_error = send_verification_for_user(user_row)
+        if not sent:
+            app.logger.warning("Verifikacioni email za %s nije poslat: %s", email, email_error)
+
         if creator_is_super_admin:
             flash("Salon je kreiran i ostajete prijavljeni kao super admin.", "success")
             return redirect(url_for("super_admin_salon_detail", salon_id=salon_id))
         session.clear()
+        session.permanent = True
         session["user_id"] = user_row["id"]
         session["user_role"] = "owner"
         session["salon_id"] = salon_id
-        flash("Salon je kreiran. Dobijate probni period za testiranje aplikacije.", "success")
+        flash(f"Salon je kreiran. Probni period traje {TRIAL_DAYS} dana.", "success")
+        if sent:
+            flash("Poslali smo vam email za potvrdu adrese.", "info")
         return redirect(url_for("dashboard"))
 
     return render_template("register.html")
+
+
+@app.route("/verify-email/<token>")
+def verify_email(token):
+    data = read_signed_token(token, "verify-email", 24 * 60 * 60)
+    if not data:
+        flash("Link za potvrdu emaila je istekao ili nije ispravan.", "error")
+        return redirect(url_for("login"))
+    user = db_query("SELECT * FROM users WHERE id = %s AND LOWER(email) = LOWER(%s)", (data["user_id"], data["email"]), one=True)
+    if not user:
+        flash("Nalog nije pronadjen.", "error")
+        return redirect(url_for("login"))
+    db_execute("UPDATE users SET email_verified = TRUE, email_verified_at = %s WHERE id = %s", (datetime.now(), user["id"]))
+    flash("Email adresa je potvrdena.", "success")
+    return redirect(url_for("home" if session.get("user_id") else "login"))
+
+
+@app.route("/resend-verification", methods=["POST"])
+@login_required
+def resend_verification():
+    user = current_user()
+    if user.get("email_verified"):
+        flash("Email adresa je vec potvrdena.", "info")
+    else:
+        sent, error = send_verification_for_user(user)
+        flash("Novi verifikacioni email je poslat." if sent else f"Email nije poslat: {error}", "success" if sent else "error")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        user = db_query("SELECT * FROM users WHERE LOWER(email) = LOWER(%s) AND active = TRUE", (email,), one=True)
+        if user:
+            token = create_signed_token("reset-password", user)
+            sent, error = send_auth_email(user["email"], user["name"], external_url("reset_password", token=token), "reset")
+            if not sent:
+                app.logger.warning("Reset email za %s nije poslat: %s", email, error)
+        flash("Ako nalog postoji, poslali smo uputstvo za promenu sifre.", "info")
+        return redirect(url_for("login"))
+    return render_template("forgot_password.html")
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    data = read_signed_token(token, "reset-password", 60 * 60)
+    if not data:
+        flash("Link za promenu sifre je istekao ili nije ispravan.", "error")
+        return redirect(url_for("forgot_password"))
+    user = db_query("SELECT * FROM users WHERE id = %s AND LOWER(email) = LOWER(%s) AND active = TRUE", (data["user_id"], data["email"]), one=True)
+    if not user or data.get("password_hash") != user.get("password_hash"):
+        flash("Link za promenu sifre je istekao ili vise nije ispravan.", "error")
+        return redirect(url_for("forgot_password"))
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        confirmation = request.form.get("password_confirm", "")
+        if len(password) < 8:
+            flash("Sifra mora imati najmanje 8 karaktera.", "error")
+        elif password != confirmation:
+            flash("Sifre se ne podudaraju.", "error")
+        else:
+            db_execute("UPDATE users SET password_hash = %s WHERE id = %s", (generate_password_hash(password), user["id"]))
+            flash("Sifra je promenjena. Sada mozete da se prijavite.", "success")
+            return redirect(url_for("login"))
+    return render_template("reset_password.html", token=token)
 
 
 @app.route("/logout")
@@ -1446,7 +2021,9 @@ def dashboard():
 def appointments():
     salon_id = current_salon()["id"]
     status = request.args.get("status", "").strip()
-    date_filter = request.args.get("date", "").strip()
+    date_filter_input = request.args.get("date", "").strip()
+    date_filter_value = parse_iso_date(date_filter_input)
+    date_filter = date_filter_value.isoformat() if date_filter_value else ""
     search = request.args.get("q", "").strip()
     worker_filter = request.args.get("worker_id", "").strip()
 
@@ -1490,7 +2067,7 @@ def appointments():
         "appointments.html",
         appointments=rows,
         workers=workers,
-        filters={"status": status, "date": date_filter, "q": search, "worker_id": worker_filter},
+        filters={"status": status, "date": date_input_value(date_filter), "q": search, "worker_id": worker_filter},
     )
 
 
@@ -1590,22 +2167,30 @@ def appointment_edit(appointment_id):
 def save_appointment(appointment_id=None):
     salon = current_salon()
     salon_id = salon["id"]
+    previous = None
+    if appointment_id:
+        previous = db_query("SELECT * FROM appointments WHERE id = %s AND salon_id = %s", (appointment_id, salon_id), one=True)
+
     client_name = request.form.get("client_name", "").strip()
     client_phone = request.form.get("client_phone", "").strip()
     client_email = request.form.get("client_email", "").strip().lower()
     service_id = request.form.get("service_id", "").strip()
     worker_id = request.form.get("worker_id", "").strip()
-    appointment_date = request.form.get("date", "").strip()
+    appointment_date_input = request.form.get("date", "").strip()
+    appointment_date = parse_iso_date(appointment_date_input)
     appointment_time = request.form.get("time", "").strip()
     status = request.form.get("status", "scheduled").strip()
     notes = request.form.get("notes", "").strip()
 
     if not client_name or not service_id or not worker_id or not appointment_date or not appointment_time:
         flash("Popunite ime klijenta, uslugu, radnika, datum i vreme.", "error")
-        return False
+        return None
+    if client_email and not valid_email(client_email):
+        flash("Email klijenta nije ispravan.", "error")
+        return None
     if status not in STATUS_LABELS:
         flash("Status termina nije ispravan.", "error")
-        return False
+        return None
 
     assignment = worker_service_assignment(
         salon_id,
@@ -1615,7 +2200,7 @@ def save_appointment(appointment_id=None):
     )
     if not assignment:
         flash("Izabrani radnik ne pruza ovu uslugu.", "error")
-        return False
+        return None
 
     duration_minutes = int(assignment["worker_duration_minutes"] or 30)
     price = max(0.0, parse_price(request.form.get("price"), fallback=assignment["worker_price"]))
@@ -1636,16 +2221,33 @@ def save_appointment(appointment_id=None):
     )
     if error:
         flash(error, "error")
-        return False
-    return bool(saved_id)
+        return None
+
+    if status == "scheduled":
+        if not previous or previous.get("status") != "scheduled":
+            send_appointment_event(saved_id, salon_id, "confirmed", "confirmed", once=True)
+        else:
+            changed = any([
+                parse_iso_date(previous.get("date")) != appointment_date,
+                time_short(previous.get("time")) != time_short(appointment_time),
+                int(previous.get("service_id") or 0) != int(service_id),
+                int(previous.get("worker_id") or 0) != int(worker_id),
+            ])
+            if changed:
+                send_appointment_event(saved_id, salon_id, f"updated-{int(datetime.now().timestamp())}", "updated")
+    elif status == "cancelled" and previous and previous.get("status") != "cancelled":
+        send_appointment_event(saved_id, salon_id, "cancelled", "cancelled", once=True)
+    return saved_id
 
 
 def appointment_email_data(appointment_id, salon_id):
-    return db_query(
+    row = db_query(
         """
-        SELECT a.date, a.time, c.name AS client_name, c.email AS client_email,
+        SELECT a.id, a.date, a.time, a.status, a.updated_at,
+               c.name AS client_name, c.email AS client_email,
                s.name AS service_name, w.name AS worker_name, sal.name AS salon_name,
-               sal.address AS salon_address, sal.phone AS salon_phone
+               sal.address AS salon_address, sal.phone AS salon_phone,
+               sal.owner_name, sal.owner_email
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
@@ -1656,6 +2258,38 @@ def appointment_email_data(appointment_id, salon_id):
         (appointment_id, salon_id),
         one=True,
     )
+    if row:
+        row = dict(row)
+        row["admin_url"] = external_url("appointments")
+    return row
+
+
+def send_appointment_event(appointment_id, salon_id, event_key, message_type, once=False):
+    if once and db_query(
+        "SELECT id FROM email_events WHERE appointment_id = %s AND event_key = %s AND successful = TRUE",
+        (appointment_id, event_key),
+        one=True,
+    ):
+        return True, None
+    data = appointment_email_data(appointment_id, salon_id)
+    if not data:
+        return False, "Termin nije pronadjen."
+    sent, error = send_appointment_message(data, message_type)
+    try:
+        db_execute(
+            """
+            INSERT INTO email_events (salon_id, appointment_id, event_key, recipient, successful, error_message, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (appointment_id, event_key)
+            DO UPDATE SET recipient = EXCLUDED.recipient, successful = EXCLUDED.successful,
+                          error_message = EXCLUDED.error_message, created_at = EXCLUDED.created_at
+            """,
+            (salon_id, appointment_id, event_key, data.get("client_email") or "", sent, error or "", datetime.now()),
+        )
+    except Exception:
+        app.logger.exception("Upis email dogadjaja nije uspeo")
+        get_db().rollback()
+    return sent, error
 
 
 @app.route("/appointments/<int:appointment_id>/status", methods=["POST"])
@@ -1702,12 +2336,17 @@ def appointment_status(appointment_id):
             (new_status, datetime.now(), appointment_id, salon_id),
         )
     if new_status == "scheduled" and previous_status != "scheduled":
-        email_data = appointment_email_data(appointment_id, salon_id)
-        sent, email_error = send_appointment_confirmation(email_data or {})
+        sent, email_error = send_appointment_event(appointment_id, salon_id, "confirmed", "confirmed", once=True)
         if sent:
             flash("Status termina je promenjen i klijentu je poslat email.", "success")
         else:
             flash(f"Status je promenjen, ali email nije poslat: {email_error}", "warning")
+    elif new_status == "cancelled" and previous_status != "cancelled":
+        sent, email_error = send_appointment_event(appointment_id, salon_id, "cancelled", "cancelled", once=True)
+        if sent:
+            flash("Termin je otkazan i klijentu je poslat email.", "success")
+        else:
+            flash(f"Termin je otkazan, ali email nije poslat: {email_error}", "warning")
     else:
         flash("Status termina je promenjen.", "success")
     return redirect(request.referrer or url_for("appointments"))
@@ -1718,8 +2357,24 @@ def appointment_status(appointment_id):
 @subscription_required
 def appointment_delete(appointment_id):
     salon_id = current_salon()["id"]
+    appointment = db_query(
+        "SELECT * FROM appointments WHERE id = %s AND salon_id = %s",
+        (appointment_id, salon_id),
+        one=True,
+    )
+    if not appointment:
+        flash("Termin nije pronadjen.", "error")
+        return redirect(url_for("appointments"))
+    email_warning = None
+    if appointment["status"] in ("pending", "scheduled"):
+        sent, error = send_appointment_event(appointment_id, salon_id, "deleted-cancelled", "cancelled", once=True)
+        if not sent:
+            email_warning = error
     db_execute("DELETE FROM appointments WHERE id = %s AND salon_id = %s", (appointment_id, salon_id))
-    flash("Termin je obrisan.", "info")
+    if email_warning:
+        flash(f"Termin je obrisan, ali email o otkazivanju nije poslat: {email_warning}", "warning")
+    else:
+        flash("Termin je obrisan.", "info")
     return redirect(url_for("appointments"))
 
 
@@ -1780,6 +2435,29 @@ def workers():
     return render_template("workers.html", workers=rows)
 
 
+def worker_schedule_context(worker_id=None, form_data=None):
+    if form_data is not None:
+        rows = []
+        for weekday, name, short in WEEKDAYS:
+            rows.append({
+                "weekday": weekday,
+                "name": name,
+                "short": short,
+                "mode": form_data.get(f"schedule_mode_{weekday}", "inherit"),
+                "open_time": form_data.get(f"schedule_open_{weekday}", "09:00"),
+                "close_time": form_data.get(f"schedule_close_{weekday}", "20:00"),
+                "break_start": form_data.get(f"break_start_{weekday}", ""),
+                "break_end": form_data.get(f"break_end_{weekday}", ""),
+            })
+        return rows
+    if worker_id:
+        return worker_schedule_rows(worker_id)
+    return [
+        {"weekday": weekday, "name": name, "short": short, "mode": "inherit", "open_time": "09:00", "close_time": "20:00", "break_start": "", "break_end": ""}
+        for weekday, name, short in WEEKDAYS
+    ]
+
+
 @app.route("/workers/new", methods=["GET", "POST"])
 @salon_required
 @subscription_required
@@ -1798,6 +2476,7 @@ def worker_new():
         worker=worker,
         services=services_rows,
         assignments={},
+        schedule=worker_schedule_context(form_data=request.form if request.method == "POST" else None),
         mode="new",
     )
 
@@ -1828,6 +2507,7 @@ def worker_edit(worker_id):
         worker=worker_data,
         services=services_rows,
         assignments=assignments,
+        schedule=worker_schedule_context(worker_id=worker_id, form_data=request.form if request.method == "POST" else None),
         mode="edit",
     )
 
@@ -1836,12 +2516,63 @@ def save_worker(worker_id=None):
     salon_id = current_salon()["id"]
     name = request.form.get("name", "").strip()
     phone = request.form.get("phone", "").strip()
-    email = request.form.get("email", "").strip()
+    email = request.form.get("email", "").strip().lower()
     notes = request.form.get("notes", "").strip()
     active = request.form.get("active") == "on"
     if not name:
         flash("Ime radnika je obavezno.", "error")
         return None
+    if email and not valid_email(email):
+        flash("Email radnika nije ispravan.", "error")
+        return None
+
+    salon_hours_map = {row["weekday"]: row for row in salon_working_hours_rows(salon_id)}
+    schedule_values = []
+    break_values = []
+    for weekday, _, _ in WEEKDAYS:
+        mode = request.form.get(f"schedule_mode_{weekday}", "inherit")
+        if mode not in ("inherit", "custom", "off"):
+            mode = "inherit"
+        open_value = request.form.get(f"schedule_open_{weekday}", "").strip() or None
+        close_value = request.form.get(f"schedule_close_{weekday}", "").strip() or None
+        if mode == "custom":
+            open_minutes = time_to_minutes(open_value)
+            close_minutes = time_to_minutes(close_value)
+            if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+                flash(f"Radno vreme za {WEEKDAYS[weekday][1]} nije ispravno.", "error")
+                return None
+        else:
+            open_value = close_value = None
+        schedule_values.append((weekday, mode, open_value, close_value))
+
+        break_start = request.form.get(f"break_start_{weekday}", "").strip() or None
+        break_end = request.form.get(f"break_end_{weekday}", "").strip() or None
+        if mode == "off":
+            break_start = break_end = None
+        if bool(break_start) != bool(break_end):
+            flash(f"Za pauzu u danu {WEEKDAYS[weekday][1]} unesite i pocetak i kraj.", "error")
+            return None
+        if break_start:
+            break_start_minutes = time_to_minutes(break_start)
+            break_end_minutes = time_to_minutes(break_end)
+            if break_start_minutes is None or break_end_minutes is None or break_end_minutes <= break_start_minutes:
+                flash(f"Pauza za {WEEKDAYS[weekday][1]} nije ispravna.", "error")
+                return None
+            salon_day = salon_hours_map.get(weekday)
+            effective_open = time_to_minutes(salon_day.get("open_time")) if salon_day and salon_day.get("is_open") else None
+            effective_close = time_to_minutes(salon_day.get("close_time")) if salon_day and salon_day.get("is_open") else None
+            if mode == "custom":
+                custom_open = time_to_minutes(open_value)
+                custom_close = time_to_minutes(close_value)
+                if effective_open is not None and effective_close is not None:
+                    effective_open = max(effective_open, custom_open)
+                    effective_close = min(effective_close, custom_close)
+                else:
+                    effective_open = effective_close = None
+            if effective_open is None or effective_close is None or break_start_minutes < effective_open or break_end_minutes > effective_close:
+                flash(f"Pauza za {WEEKDAYS[weekday][1]} mora biti unutar stvarnog radnog vremena.", "error")
+                return None
+        break_values.append((weekday, break_start, break_end))
 
     service_rows = db_query("SELECT * FROM services WHERE salon_id = %s ORDER BY id", (salon_id,))
     now = datetime.now()
@@ -1873,6 +2604,32 @@ def save_worker(worker_id=None):
                 flash("Radnik nije pronadjen.", "error")
                 return None
             worker_id = worker_row["id"]
+
+            for weekday, mode, open_value, close_value in schedule_values:
+                cur.execute(
+                    """
+                    INSERT INTO worker_working_hours (worker_id, weekday, mode, open_time, close_time, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (worker_id, weekday)
+                    DO UPDATE SET mode = EXCLUDED.mode, open_time = EXCLUDED.open_time,
+                                  close_time = EXCLUDED.close_time, updated_at = EXCLUDED.updated_at
+                    """,
+                    (worker_id, weekday, mode, open_value, close_value, now),
+                )
+            for weekday, break_start, break_end in break_values:
+                if break_start and break_end:
+                    cur.execute(
+                        """
+                        INSERT INTO worker_breaks (worker_id, weekday, start_time, end_time, updated_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (worker_id, weekday)
+                        DO UPDATE SET start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time,
+                                      updated_at = EXCLUDED.updated_at
+                        """,
+                        (worker_id, weekday, break_start, break_end, now),
+                    )
+                else:
+                    cur.execute("DELETE FROM worker_breaks WHERE worker_id = %s AND weekday = %s", (worker_id, weekday))
 
             for service in service_rows:
                 selected = request.form.get(f"service_{service['id']}") == "on"
@@ -1952,6 +2709,159 @@ def worker_delete(worker_id):
     return redirect(url_for("workers"))
 
 
+@app.route("/calendar")
+@salon_required
+@subscription_required
+def appointment_calendar():
+    salon = current_salon()
+    salon_id = salon["id"]
+    selected_date = parse_iso_date(request.args.get("date")) or local_today()
+    view = request.args.get("view", "day").strip()
+    if view not in ("day", "week"):
+        view = "day"
+    worker_filter = request.args.get("worker_id", "").strip()
+
+    all_workers = db_query(
+        "SELECT * FROM workers WHERE salon_id = %s AND active = TRUE ORDER BY name",
+        (salon_id,),
+    )
+    workers_rows = [row for row in all_workers if not worker_filter or str(row["id"]) == str(worker_filter)]
+
+    if view == "week":
+        week_start = selected_date - timedelta(days=selected_date.weekday())
+        week_end = week_start + timedelta(days=6)
+        rows = db_query(
+            """
+            SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+                   w.name AS worker_name
+            FROM appointments a
+            JOIN clients c ON c.id = a.client_id
+            JOIN services s ON s.id = a.service_id
+            LEFT JOIN workers w ON w.id = a.worker_id
+            WHERE a.salon_id = %s AND a.date BETWEEN %s AND %s
+              AND a.status != 'cancelled'
+              AND (%s = '' OR a.worker_id = %s)
+            ORDER BY a.date, a.time
+            """,
+            (salon_id, week_start, week_end, worker_filter, worker_filter or None),
+        )
+        by_date = {}
+        for item in rows:
+            by_date.setdefault(item["date"], []).append(item)
+        week_days = [
+            {
+                "date": week_start + timedelta(days=offset),
+                "appointments": by_date.get(week_start + timedelta(days=offset), []),
+                "is_today": week_start + timedelta(days=offset) == local_today(),
+            }
+            for offset in range(7)
+        ]
+        return render_template(
+            "appointment_calendar.html",
+            view=view,
+            selected_date=selected_date,
+            workers=all_workers,
+            worker_filter=worker_filter,
+            week_start=week_start,
+            week_end=week_end,
+            week_days=week_days,
+            previous_date=(week_start - timedelta(days=7)).isoformat(),
+            next_date=(week_start + timedelta(days=7)).isoformat(),
+        )
+
+    appointments_rows = db_query(
+        """
+        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+               w.name AS worker_name
+        FROM appointments a
+        JOIN clients c ON c.id = a.client_id
+        JOIN services s ON s.id = a.service_id
+        LEFT JOIN workers w ON w.id = a.worker_id
+        WHERE a.salon_id = %s AND a.date = %s AND a.status != 'cancelled'
+        ORDER BY a.time
+        """,
+        (salon_id, selected_date),
+    )
+    appointment_map = {}
+    for item in appointments_rows:
+        appointment_map.setdefault(item["worker_id"], []).append(item)
+
+    time_off_rows = db_query(
+        """
+        SELECT * FROM worker_time_off
+        WHERE salon_id = %s AND start_date <= %s AND end_date >= %s
+        """,
+        (salon_id, selected_date, selected_date),
+    )
+    time_off_map = {}
+    for item in time_off_rows:
+        time_off_map.setdefault(item["worker_id"], []).append(item)
+
+    schedules = []
+    opens = []
+    closes = []
+    for worker in workers_rows:
+        schedule = effective_worker_hours(salon_id, worker["id"], selected_date)
+        if schedule:
+            opens.append(schedule["open"])
+            closes.append(schedule["close"])
+        schedules.append((worker, schedule))
+    timeline_start = (min(opens) // 30) * 30 if opens else 9 * 60
+    timeline_end = ((max(closes) + 29) // 30) * 30 if closes else 20 * 60
+    timeline_end = max(timeline_end, timeline_start + 60)
+    pixels_per_minute = 0.8
+    timeline_height = int((timeline_end - timeline_start) * pixels_per_minute)
+    time_labels = [
+        {"label": minutes_to_time(value), "top": int((value - timeline_start) * pixels_per_minute)}
+        for value in range(timeline_start, timeline_end + 1, 30)
+    ]
+
+    lanes = []
+    for worker, schedule in schedules:
+        lane_appointments = []
+        for item in appointment_map.get(worker["id"], []):
+            start_minutes = time_to_minutes(item["time"])
+            duration = int(item.get("duration_minutes") or 30)
+            lane_appointments.append({
+                **dict(item),
+                "top": max(0, int((start_minutes - timeline_start) * pixels_per_minute)),
+                "height": max(30, int(duration * pixels_per_minute)),
+            })
+        blocks = []
+        if schedule:
+            for start_minutes, end_minutes in schedule["breaks"]:
+                blocks.append({
+                    "label": "Pauza",
+                    "top": max(0, int((start_minutes - timeline_start) * pixels_per_minute)),
+                    "height": max(20, int((end_minutes - start_minutes) * pixels_per_minute)),
+                })
+        for off in time_off_map.get(worker["id"], []):
+            if off["all_day"] or off.get("start_time") is None or off.get("end_time") is None:
+                blocks.append({"label": off.get("reason") or "Ne radi", "top": 0, "height": timeline_height})
+            else:
+                off_start = time_to_minutes(off["start_time"])
+                off_end = time_to_minutes(off["end_time"])
+                blocks.append({
+                    "label": off.get("reason") or "Odsustvo",
+                    "top": max(0, int((off_start - timeline_start) * pixels_per_minute)),
+                    "height": max(20, int((off_end - off_start) * pixels_per_minute)),
+                })
+        lanes.append({"worker": worker, "schedule": schedule, "appointments": lane_appointments, "blocks": blocks})
+
+    return render_template(
+        "appointment_calendar.html",
+        view=view,
+        selected_date=selected_date,
+        workers=all_workers,
+        worker_filter=worker_filter,
+        lanes=lanes,
+        time_labels=time_labels,
+        timeline_height=timeline_height,
+        previous_date=(selected_date - timedelta(days=1)).isoformat(),
+        next_date=(selected_date + timedelta(days=1)).isoformat(),
+    )
+
+
 def parse_calendar_month(value):
     try:
         parsed = datetime.strptime(value, "%Y-%m").date()
@@ -1960,10 +2870,10 @@ def parse_calendar_month(value):
         return local_today().replace(day=1)
 
 
-@app.route("/calendar", methods=["GET", "POST"])
+@app.route("/availability", methods=["GET", "POST"])
 @salon_required
 @subscription_required
-def worker_calendar():
+def worker_availability_calendar():
     salon_id = current_salon()["id"]
     if request.method == "POST":
         worker_id = request.form.get("worker_id", "").strip()
@@ -2000,7 +2910,7 @@ def worker_calendar():
                     if not cur.fetchone():
                         connection.rollback()
                         flash("Radnik nije pronadjen.", "error")
-                        return redirect(url_for("worker_calendar"))
+                        return redirect(url_for("worker_availability_calendar"))
                     cur.execute(
                         """
                         INSERT INTO worker_time_off
@@ -2024,7 +2934,7 @@ def worker_calendar():
                 connection.rollback()
                 raise
         month_value = start_date.strftime("%Y-%m") if start_date else local_today().strftime("%Y-%m")
-        return redirect(url_for("worker_calendar", month=month_value, worker_id=worker_id))
+        return redirect(url_for("worker_availability_calendar", month=month_value, worker_id=worker_id))
 
     month_start = parse_calendar_month(request.args.get("month"))
     if month_start.month == 12:
@@ -2078,7 +2988,7 @@ def worker_calendar():
         )
 
     return render_template(
-        "calendar.html",
+        "availability.html",
         workers=workers_rows,
         calendar_weeks=calendar_weeks,
         month_start=month_start,
@@ -2089,7 +2999,7 @@ def worker_calendar():
     )
 
 
-@app.route("/calendar/time-off/<int:time_off_id>/delete", methods=["POST"])
+@app.route("/availability/time-off/<int:time_off_id>/delete", methods=["POST"])
 @salon_required
 @subscription_required
 def worker_time_off_delete(time_off_id):
@@ -2102,9 +3012,9 @@ def worker_time_off_delete(time_off_id):
     if row:
         db_execute("DELETE FROM worker_time_off WHERE id = %s AND salon_id = %s", (time_off_id, salon_id))
         flash("Odsustvo je uklonjeno.", "info")
-        return redirect(url_for("worker_calendar", month=row["start_date"].strftime("%Y-%m"), worker_id=row["worker_id"]))
+        return redirect(url_for("worker_availability_calendar", month=row["start_date"].strftime("%Y-%m"), worker_id=row["worker_id"]))
     flash("Odsustvo nije pronadjeno.", "error")
-    return redirect(url_for("worker_calendar"))
+    return redirect(url_for("worker_availability_calendar"))
 
 
 @app.route("/services")
@@ -2232,11 +3142,46 @@ def service_delete(service_id):
 @app.route("/settings", methods=["GET", "POST"])
 @salon_required
 def settings_page():
-    salon_id = current_salon()["id"]
+    salon = current_salon()
+    salon_id = salon["id"]
     if request.method == "POST":
         booking_mode = request.form.get("booking_mode", "manual").strip()
         if booking_mode not in ("manual", "automatic"):
             booking_mode = "manual"
+
+        weekly_values = []
+        for weekday, name, short in WEEKDAYS:
+            is_open = request.form.get(f"day_open_{weekday}") == "on"
+            open_value = request.form.get(f"day_open_time_{weekday}", "").strip() or None
+            close_value = request.form.get(f"day_close_time_{weekday}", "").strip() or None
+            if is_open:
+                open_minutes = time_to_minutes(open_value)
+                close_minutes = time_to_minutes(close_value)
+                if open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
+                    flash(f"Radno vreme za {name} nije ispravno.", "error")
+                    return render_template("settings.html", working_hours=salon_working_hours_rows(salon_id))
+            else:
+                open_value = close_value = None
+            weekly_values.append({
+                "weekday": weekday,
+                "name": name,
+                "short": short,
+                "is_open": is_open,
+                "open_time": open_value,
+                "close_time": close_value,
+            })
+        if not any(item["is_open"] for item in weekly_values):
+            flash("Salon mora imati najmanje jedan radni dan.", "error")
+            return render_template("settings.html", working_hours=weekly_values)
+
+        try:
+            min_notice = max(0, min(int(request.form.get("booking_min_notice_minutes", "120")), 10080))
+            max_days = max(1, min(int(request.form.get("booking_max_days", "90")), 365))
+            cancellation_hours = max(0, min(int(request.form.get("cancellation_notice_hours", "24")), 336))
+        except (TypeError, ValueError):
+            flash("Pravila zakazivanja moraju biti brojevi.", "error")
+            return render_template("settings.html", working_hours=weekly_values)
+
         value_map = {
             "name": request.form.get("business_name", "").strip(),
             "business_type": request.form.get("business_type", "").strip(),
@@ -2244,46 +3189,62 @@ def settings_page():
             "whatsapp": request.form.get("whatsapp", "").strip(),
             "instagram": request.form.get("instagram", "").strip(),
             "address": request.form.get("address", "").strip(),
-            "working_hours": request.form.get("working_hours", "").strip(),
-            "open_time": request.form.get("open_time", "09:00").strip(),
-            "close_time": request.form.get("close_time", "20:00").strip(),
             "slot_minutes": BOOKING_SLOT_MINUTES,
             "booking_mode": booking_mode,
             "booking_note": request.form.get("booking_note", "").strip(),
         }
-        open_minutes = time_to_minutes(value_map["open_time"])
-        close_minutes = time_to_minutes(value_map["close_time"])
-        if not value_map["name"] or open_minutes is None or close_minutes is None or close_minutes <= open_minutes:
-            flash("Unesite naziv salona i ispravno vreme otvaranja i zatvaranja.", "error")
-            return render_template("settings.html")
-        db_execute(
-            """
-            UPDATE salons
-            SET name = %s, business_type = %s, phone = %s, whatsapp = %s, instagram = %s,
-                address = %s, working_hours = %s, open_time = %s, close_time = %s,
-                slot_minutes = %s, booking_mode = %s, booking_note = %s, updated_at = %s
-            WHERE id = %s
-            """,
-            (
-                value_map["name"],
-                value_map["business_type"],
-                value_map["phone"],
-                value_map["whatsapp"],
-                value_map["instagram"],
-                value_map["address"],
-                value_map["working_hours"],
-                value_map["open_time"],
-                value_map["close_time"],
-                value_map["slot_minutes"],
-                value_map["booking_mode"],
-                value_map["booking_note"],
-                datetime.now(),
-                salon_id,
-            ),
-        )
+        if not value_map["name"]:
+            flash("Naziv salona je obavezan.", "error")
+            return render_template("settings.html", working_hours=weekly_values)
+
+        opened = [item for item in weekly_values if item["is_open"]]
+        fallback_open = min(opened, key=lambda item: time_to_minutes(item["open_time"]))["open_time"]
+        fallback_close = max(opened, key=lambda item: time_to_minutes(item["close_time"]))["close_time"]
+        summary_rows = [
+            {**item, "open_time": item["open_time"] or time(9, 0), "close_time": item["close_time"] or time(20, 0)}
+            for item in weekly_values
+        ]
+        working_summary = format_working_hours_summary(summary_rows)
+
+        connection = get_db()
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE salons
+                    SET name = %s, business_type = %s, phone = %s, whatsapp = %s, instagram = %s,
+                        address = %s, working_hours = %s, open_time = %s, close_time = %s,
+                        slot_minutes = %s, booking_mode = %s, booking_note = %s,
+                        booking_min_notice_minutes = %s, booking_max_days = %s,
+                        cancellation_notice_hours = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        value_map["name"], value_map["business_type"], value_map["phone"],
+                        value_map["whatsapp"], value_map["instagram"], value_map["address"],
+                        working_summary, fallback_open, fallback_close, value_map["slot_minutes"],
+                        value_map["booking_mode"], value_map["booking_note"], min_notice,
+                        max_days, cancellation_hours, datetime.now(), salon_id,
+                    ),
+                )
+                for item in weekly_values:
+                    cur.execute(
+                        """
+                        INSERT INTO salon_working_hours (salon_id, weekday, is_open, open_time, close_time, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (salon_id, weekday)
+                        DO UPDATE SET is_open = EXCLUDED.is_open, open_time = EXCLUDED.open_time,
+                                      close_time = EXCLUDED.close_time, updated_at = EXCLUDED.updated_at
+                        """,
+                        (salon_id, item["weekday"], item["is_open"], item["open_time"], item["close_time"], datetime.now()),
+                    )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         flash("Podesavanja su sacuvana.", "success")
         return redirect(url_for("settings_page"))
-    return render_template("settings.html")
+    return render_template("settings.html", working_hours=salon_working_hours_rows(salon_id))
 
 
 @app.route("/subscription")
@@ -2402,6 +3363,14 @@ def public_booking(slug):
 
     salon_id = salon["id"]
     if request.method == "POST":
+        ip_address = request_ip()
+        if booking_is_rate_limited(salon_id, ip_address):
+            flash(
+                f"Poslato je previše zahteva. Pokušajte ponovo za {BOOKING_WINDOW_MINUTES} minuta ili pozovite salon.",
+                "error",
+            )
+            return render_template("booking.html", **public_booking_context(salon, dict(request.form))), 429
+        record_booking_attempt(salon_id, ip_address)
         client_name = request.form.get("client_name", "").strip()
         client_phone = request.form.get("client_phone", "").strip()
         client_email = request.form.get("client_email", "").strip().lower()
@@ -2410,6 +3379,8 @@ def public_booking(slug):
         appointment_date = request.form.get("date", "").strip()
         appointment_time = request.form.get("time", "").strip()
         notes = request.form.get("notes", "").strip()
+        privacy_accepted = request.form.get("privacy_accepted") == "on"
+        marketing_accepted = request.form.get("marketing_accepted") == "on"
         form_data = dict(request.form)
 
         try:
@@ -2422,13 +3393,26 @@ def public_booking(slug):
         if not client_name or not client_phone or not client_email or not service_id or not worker_id or not appointment_date or not appointment_time:
             flash("Popunite ime, telefon, email, uslugu, radnika, datum i vreme.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
+        if not valid_email(client_email):
+            flash("Unesite ispravnu email adresu.", "error")
+            return render_template("booking.html", **public_booking_context(salon, form_data))
+        if not privacy_accepted:
+            flash("Morate prihvatiti Politiku privatnosti da bi salon obradio zahtev za termin.", "error")
+            return render_template("booking.html", **public_booking_context(salon, form_data))
 
         assignment = worker_service_assignment(salon_id, worker_id, service_id, active_only=True)
         if not assignment:
             flash("Izabrani radnik trenutno ne pruza ovu uslugu.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
 
-        client_id = get_or_create_client(salon_id, client_name, client_phone, client_email)
+        client_id = get_or_create_client(
+            salon_id,
+            client_name,
+            client_phone,
+            client_email,
+            privacy_consent=True,
+            marketing_consent=marketing_accepted,
+        )
         status = "scheduled" if salon.get("booking_mode") == "automatic" else "pending"
         appointment_id, error = persist_appointment_locked(
             salon,
@@ -2443,22 +3427,48 @@ def public_booking(slug):
             "public",
             notes,
             public_request=True,
+            public_token=secrets.token_urlsafe(24),
         )
         if error:
             flash(error + " Osvezite listu i izaberite drugi termin.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
         if status == "scheduled":
-            email_data = appointment_email_data(appointment_id, salon_id)
-            sent, email_error = send_appointment_confirmation(email_data or {})
+            sent, email_error = send_appointment_event(appointment_id, salon_id, "confirmed", "confirmed", once=True)
             if not sent:
                 app.logger.warning("Automatska potvrda za termin %s nije poslata: %s", appointment_id, email_error)
-        return redirect(url_for("booking_success", slug=slug, appointment_id=appointment_id))
+        else:
+            sent, email_error = send_appointment_event(appointment_id, salon_id, "request-received", "request_received", once=True)
+            if not sent:
+                app.logger.warning("Email o primljenom zahtevu za termin %s nije poslat: %s", appointment_id, email_error)
+
+        email_data = appointment_email_data(appointment_id, salon_id) or {}
+        salon_sent, salon_error = send_salon_new_request(email_data)
+        try:
+            db_execute(
+                """
+                INSERT INTO email_events (salon_id, appointment_id, event_key, recipient, successful, error_message, created_at)
+                VALUES (%s, %s, 'salon-new-booking', %s, %s, %s, %s)
+                ON CONFLICT (appointment_id, event_key)
+                DO UPDATE SET recipient = EXCLUDED.recipient, successful = EXCLUDED.successful,
+                              error_message = EXCLUDED.error_message, created_at = EXCLUDED.created_at
+                """,
+                (salon_id, appointment_id, email_data.get("owner_email") or "", salon_sent, salon_error or "", datetime.now()),
+            )
+        except Exception:
+            app.logger.exception("Logovanje emaila salonu nije uspelo")
+            get_db().rollback()
+        appointment_public = db_query(
+            "SELECT public_token FROM appointments WHERE id = %s AND salon_id = %s",
+            (appointment_id, salon_id),
+            one=True,
+        )
+        return redirect(url_for("booking_success", slug=slug, token=appointment_public["public_token"]))
 
     return render_template("booking.html", **public_booking_context(salon))
 
 
-@app.route("/s/<slug>/zakazi/uspesno/<int:appointment_id>")
-def booking_success(slug, appointment_id):
+@app.route("/s/<slug>/zakazi/uspesno/<token>")
+def booking_success(slug, token):
     salon = db_query("SELECT * FROM salons WHERE slug = %s", (slug,), one=True)
     if not salon:
         return redirect(url_for("legacy_booking"))
@@ -2469,14 +3479,76 @@ def booking_success(slug, appointment_id):
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
         LEFT JOIN workers w ON w.id = a.worker_id
-        WHERE a.id = %s AND a.salon_id = %s
+        WHERE a.public_token = %s AND a.salon_id = %s
         """,
-        (appointment_id, salon["id"]),
+        (token, salon["id"]),
         one=True,
     )
     if not appointment:
         return redirect(url_for("public_booking", slug=slug))
     return render_template("booking_success.html", appointment=appointment, salon=salon)
+
+
+@app.route("/tasks/send-reminders", methods=["GET", "POST"])
+def send_reminders_task():
+    cron_secret = os.environ.get("CRON_SECRET", "").strip()
+    supplied = request.headers.get("X-Cron-Secret", "") or request.args.get("secret", "")
+    if not cron_secret or not supplied or not secrets.compare_digest(cron_secret, supplied):
+        return jsonify({"ok": False, "error": "Nedozvoljen pristup."}), 403
+
+    now = local_now()
+    rows = db_query(
+        """
+        SELECT a.id, a.salon_id, a.date, a.time
+        FROM appointments a
+        JOIN salons s ON s.id = a.salon_id
+        WHERE a.status = 'scheduled'
+          AND a.date BETWEEN %s AND %s
+          AND (s.subscription_status IN ('active', 'free')
+               OR (s.subscription_status = 'trial' AND s.trial_ends_at >= %s))
+        ORDER BY a.date, a.time
+        """,
+        (now.date(), now.date() + timedelta(days=2), now.date()),
+    )
+    sent_count = 0
+    failed_count = 0
+    for row in rows:
+        start_minutes = time_to_minutes(row["time"])
+        if start_minutes is None:
+            continue
+        appointment_start = datetime.combine(
+            parse_iso_date(row["date"]),
+            time(start_minutes // 60, start_minutes % 60),
+            tzinfo=now.tzinfo,
+        )
+        minutes_until = (appointment_start - now).total_seconds() / 60
+        reminder = None
+        event_key = None
+        if 1425 <= minutes_until <= 1455:
+            reminder = "reminder_24h"
+            event_key = "reminder-24h"
+        elif 105 <= minutes_until <= 135:
+            reminder = "reminder_2h"
+            event_key = "reminder-2h"
+        if not reminder:
+            continue
+        sent, error = send_appointment_event(row["id"], row["salon_id"], event_key, reminder, once=True)
+        if sent:
+            sent_count += 1
+        else:
+            failed_count += 1
+            app.logger.warning("Podsetnik %s za termin %s nije poslat: %s", reminder, row["id"], error)
+    return jsonify({"ok": True, "sent": sent_count, "failed": failed_count, "checked": len(rows)})
+
+
+@app.route("/privacy")
+def privacy_policy():
+    return render_template("privacy.html")
+
+
+@app.route("/terms")
+def terms_of_service():
+    return render_template("terms.html")
 
 
 @app.route("/export/appointments.csv")
@@ -2630,7 +3702,9 @@ def super_admin_salon_detail(salon_id):
 def super_admin_update_subscription(salon_id):
     status = request.form.get("subscription_status", "trial").strip()
     plan = request.form.get("subscription_plan", "trial").strip()
-    trial_ends_at = request.form.get("trial_ends_at", "").strip() or None
+    trial_ends_at_input = request.form.get("trial_ends_at", "").strip()
+    trial_ends_at_value = parse_iso_date(trial_ends_at_input) if trial_ends_at_input else None
+    trial_ends_at = trial_ends_at_value.isoformat() if trial_ends_at_value else None
     if status not in SUBSCRIPTION_LABELS:
         status = "trial"
     if plan not in PLAN_LABELS:

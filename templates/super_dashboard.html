@@ -25,7 +25,7 @@
         <small>Placaju ili su rucno aktivni</small>
     </article>
     <article class="stat-card">
-        <span>Trial</span>
+        <span>Probni period</span>
         <strong>{{ stats.trial_salons }}</strong>
         <small>Probni period</small>
     </article>
@@ -82,8 +82,8 @@
         <h2>Prihod - procena</h2>
         <p>Dok ne povezemo Paddle, ovo je procena na osnovu rucno postavljenih aktivnih paketa.</p>
         <div class="mini-list">
-            <div><span>Mesecni aktivni</span><strong>{{ stats.monthly_salons }} x {{ monthly_price_eur }} EUR = {{ calculated.mrr }} EUR / mesec</strong></div>
-            <div><span>Godisnji aktivni</span><strong>{{ stats.yearly_salons }} x {{ yearly_price_eur }} EUR = {{ calculated.arr }} EUR / godina</strong></div>
+            <div><span>Mesecni aktivni</span><strong>{{ stats.monthly_salons }} x {{ monthly_price_eur|euro }} = {{ calculated.mrr }} EUR / mesec</strong></div>
+            <div><span>Godisnji aktivni</span><strong>{{ stats.yearly_salons }} x {{ yearly_price_eur|euro }} = {{ calculated.arr }} EUR / godina</strong></div>
             <div><span>Sledeci korak</span><strong>Paddle checkout + webhook za automatsku aktivaciju</strong></div>
         </div>
     </section>

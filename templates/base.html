@@ -3,6 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{% block title %}{{ app_name }}{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
 </head>
@@ -74,7 +75,8 @@
                 <a class="nav-link {% if request.endpoint in ['appointments', 'appointment_new', 'appointment_edit'] %}active{% endif %}" href="{{ url_for('appointments') }}">Termini</a>
                 <a class="nav-link {% if request.endpoint == 'clients' %}active{% endif %}" href="{{ url_for('clients') }}">Klijenti</a>
                 <a class="nav-link {% if request.endpoint in ['workers', 'worker_new', 'worker_edit'] %}active{% endif %}" href="{{ url_for('workers') }}">Radnici</a>
-                <a class="nav-link {% if request.endpoint in ['worker_calendar', 'worker_time_off_delete'] %}active{% endif %}" href="{{ url_for('worker_calendar') }}">Kalendar</a>
+                <a class="nav-link {% if request.endpoint == 'appointment_calendar' %}active{% endif %}" href="{{ url_for('appointment_calendar') }}">Kalendar</a>
+                <a class="nav-link {% if request.endpoint in ['worker_availability_calendar', 'worker_time_off_delete'] %}active{% endif %}" href="{{ url_for('worker_availability_calendar') }}">Odsustva</a>
                 <a class="nav-link {% if request.endpoint in ['services', 'service_new', 'service_edit'] %}active{% endif %}" href="{{ url_for('services') }}">Usluge</a>
                 <a class="nav-link {% if request.endpoint == 'settings_page' %}active{% endif %}" href="{{ url_for('settings_page') }}">Podesavanja</a>
                 <a class="nav-link {% if request.endpoint == 'subscription_page' %}active{% endif %}" href="{{ url_for('subscription_page') }}">Pretplata</a>
@@ -104,6 +106,15 @@
                     </div>
                 {% endif %}
             {% endwith %}
+
+            {% if current_user and not current_user.email_verified %}
+            <div class="flash flash-warning verification-banner">
+                Email adresa naloga nije potvrđena. Potvrda štiti nalog i omogućava pouzdan reset lozinke.
+                <form method="post" action="{{ url_for('resend_verification') }}" class="inline-form">
+                    <button class="link-button" type="submit">Pošalji verifikacioni email ponovo</button>
+                </form>
+            </div>
+            {% endif %}
 
             {% if current_salon and not subscription_is_allowed %}
             <div class="flash flash-warning">
