@@ -42,9 +42,11 @@
             <a class="btn btn-mini" href="{{ url_for('worker_edit', worker_id=worker.id) }}">Uredi</a>
             <a class="btn btn-mini btn-secondary" href="{{ url_for('worker_availability_calendar', worker_id=worker.id) }}">Odsustva</a>
             <form method="post" action="{{ url_for('worker_toggle', worker_id=worker.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="btn btn-mini btn-secondary" type="submit">{% if worker.active %}Deaktiviraj{% else %}Aktiviraj{% endif %}</button>
             </form>
             <form method="post" action="{{ url_for('worker_delete', worker_id=worker.id) }}" data-confirm="Obrisati radnika?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="btn btn-mini btn-ghost" type="submit">Obriši</button>
             </form>
         </div>

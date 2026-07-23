@@ -29,11 +29,11 @@
         </div>
         <form method="get" class="calendar-filter calendar-view-filter">
             <input type="hidden" name="date" value="{{ selected_date.isoformat() }}">
-            <select name="view" onchange="this.form.submit()">
+            <select class="auto-submit" name="view">
                 <option value="day" {% if view == 'day' %}selected{% endif %}>Dnevni prikaz</option>
                 <option value="week" {% if view == 'week' %}selected{% endif %}>Nedeljni prikaz</option>
             </select>
-            <select name="worker_id" onchange="this.form.submit()">
+            <select class="auto-submit" name="worker_id">
                 <option value="">Svi radnici</option>
                 {% for worker in workers %}
                 <option value="{{ worker.id }}" {% if worker_filter|string == worker.id|string %}selected{% endif %}>{{ worker.name }}</option>

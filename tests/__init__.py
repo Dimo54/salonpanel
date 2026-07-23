@@ -1,0 +1,1 @@
+"""SalonPanel automated tests."""

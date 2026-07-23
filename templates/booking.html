@@ -57,6 +57,7 @@
                   data-selected-date="{{ form_data.get('date', '') }}"
                   data-selected-time="{{ form_data.get('time', '') }}"
                   data-max-days="{{ settings.booking_max_days }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <div class="booking-form-section">
                     <span class="booking-step-number">1</span>
                     <div class="booking-section-content">

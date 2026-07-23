@@ -1,0 +1,60 @@
+__pycache__/
+*.py[cod]
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Flask local instance data
+instance/
+
+# Python test, coverage, and tooling artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# PostgreSQL and Supabase dumps/backups
+*.dump
+*.dump.gz
+*.backup
+*.bak
+*.sql.gz
+supabase/.temp/
+
+# Logs
+*.log
+logs/
+
+# Private keys and certificates
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Temporary editor and operating-system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

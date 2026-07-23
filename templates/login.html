@@ -41,6 +41,7 @@
             {% endwith %}
 
             <form method="post" class="form-stack">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <label>
                     Email
                     <input type="email" name="email" autocomplete="username" required>

@@ -1,5 +1,7 @@
 import csv
 import calendar as calendar_module
+import hashlib
+import hmac
 import io
 import os
 import re
@@ -7,7 +9,7 @@ import secrets
 import unicodedata
 from datetime import date, datetime, time, timedelta
 from functools import wraps
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -18,6 +20,7 @@ from flask import (
     flash,
     g,
     jsonify,
+    make_response,
     redirect,
     render_template,
     request,
@@ -45,6 +48,7 @@ EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 app = Flask(__name__, instance_relative_config=True)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 _secret_key = os.environ.get("SECRET_KEY", "").strip()
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
 if not _secret_key:
     if os.environ.get("RENDER"):
         raise RuntimeError("SECRET_KEY nije podesen. Dodaj jaku nasumicnu vrednost u Render Environment.")
@@ -53,15 +57,22 @@ app.config.update(
     SECRET_KEY=_secret_key,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")),
+    SESSION_COOKIE_SECURE=bool(os.environ.get("RENDER")) or APP_BASE_URL.lower().startswith("https://"),
+    SESSION_REFRESH_EACH_REQUEST=False,
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
 )
-APP_BASE_URL = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
 LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "5"))
 LOGIN_WINDOW_MINUTES = int(os.environ.get("LOGIN_WINDOW_MINUTES", "15"))
+LOGIN_REQUEST_MAX_ATTEMPTS = int(os.environ.get("LOGIN_REQUEST_MAX_ATTEMPTS", "20"))
+PASSWORD_RESET_MAX_REQUESTS = int(os.environ.get("PASSWORD_RESET_MAX_REQUESTS", "5"))
+PASSWORD_RESET_WINDOW_MINUTES = int(os.environ.get("PASSWORD_RESET_WINDOW_MINUTES", "30"))
+AVAILABILITY_MAX_REQUESTS = int(os.environ.get("AVAILABILITY_MAX_REQUESTS", "60"))
+AVAILABILITY_WINDOW_MINUTES = int(os.environ.get("AVAILABILITY_WINDOW_MINUTES", "10"))
 BOOKING_MAX_REQUESTS = int(os.environ.get("BOOKING_MAX_REQUESTS", "8"))
 BOOKING_WINDOW_MINUTES = int(os.environ.get("BOOKING_WINDOW_MINUTES", "30"))
+RATE_LIMIT_RETENTION_HOURS = max(1, int(os.environ.get("RATE_LIMIT_RETENTION_HOURS", "48")))
+RATE_LIMIT_CLEANUP_BATCH_SIZE = max(1, int(os.environ.get("RATE_LIMIT_CLEANUP_BATCH_SIZE", "500")))
 WEEKDAYS = [
     (0, "Ponedeljak", "Pon"),
     (1, "Utorak", "Uto"),
@@ -362,6 +373,13 @@ def init_db():
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS rate_limit_attempts (
+        id BIGSERIAL PRIMARY KEY,
+        scope TEXT NOT NULL,
+        key_hash TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS email_events (
         id BIGSERIAL PRIMARY KEY,
         salon_id INTEGER REFERENCES salons(id) ON DELETE CASCADE,
@@ -403,6 +421,8 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_worker_time_off_lookup ON worker_time_off(worker_id, start_date, end_date);
     CREATE INDEX IF NOT EXISTS idx_login_attempts_lookup ON login_attempts(email, ip_address, created_at);
     CREATE INDEX IF NOT EXISTS idx_booking_attempts_lookup ON booking_attempts(salon_id, ip_address, created_at);
+    CREATE INDEX IF NOT EXISTS idx_rate_limit_attempts_lookup ON rate_limit_attempts(scope, key_hash, created_at);
+    CREATE INDEX IF NOT EXISTS idx_rate_limit_attempts_created_at ON rate_limit_attempts(created_at);
     CREATE INDEX IF NOT EXISTS idx_email_events_appointment ON email_events(appointment_id, event_key);
     CREATE INDEX IF NOT EXISTS idx_appointments_salon_date ON appointments(salon_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_worker_date ON appointments(worker_id, date, time);
@@ -717,6 +737,102 @@ def request_ip():
     return (request.remote_addr or "")[:80]
 
 
+def safe_local_redirect(target):
+    target = str(target or "").strip()
+    if (
+        not target
+        or not target.startswith("/")
+        or target.startswith("//")
+        or "\\" in target
+        or any(ord(character) < 32 or ord(character) == 127 for character in target)
+    ):
+        return None
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc:
+        return None
+    return target
+
+
+def rate_limit_identifier_hash(scope, identifier):
+    domain = b"salonpanel:rate-limit-identifier:v1\x00"
+    message = domain + str(scope or "").encode("utf-8") + b"\x00" + str(identifier or "").encode("utf-8")
+    secret = str(app.config["SECRET_KEY"]).encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def cleanup_expired_rate_limits(cursor, now=None):
+    """Delete at most one indexed batch older than the bounded retention period."""
+    retention_cutoff = (now or datetime.now()) - timedelta(hours=RATE_LIMIT_RETENTION_HOURS)
+    cursor.execute(
+        """
+        DELETE FROM rate_limit_attempts
+        WHERE id IN (
+            SELECT id
+            FROM rate_limit_attempts
+            WHERE created_at < %s
+            ORDER BY created_at ASC
+            LIMIT %s
+        )
+        """,
+        (retention_cutoff, RATE_LIMIT_CLEANUP_BATCH_SIZE),
+    )
+
+
+def rate_limit_exceeded(scope, identifier, max_requests, window_minutes):
+    """Atomically record an attempt and report whether the rolling limit was reached."""
+    try:
+        max_requests = max(1, int(max_requests))
+        window_minutes = max(1, int(window_minutes))
+    except (TypeError, ValueError):
+        raise ValueError("Rate-limit values must be positive integers.")
+
+    scope = str(scope or "")[:80]
+    key_hash = rate_limit_identifier_hash(scope, identifier)
+    cutoff = datetime.now() - timedelta(minutes=window_minutes)
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            cleanup_expired_rate_limits(cur)
+            # Serialize the count-and-insert sequence for this identity across
+            # all application processes, not only within one Gunicorn worker.
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"{scope}:{key_hash}",))
+            cur.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM rate_limit_attempts
+                WHERE scope = %s AND key_hash = %s AND created_at >= %s
+                """,
+                (scope, key_hash, cutoff),
+            )
+            row = cur.fetchone()
+            if row and row["total"] >= max_requests:
+                connection.commit()
+                return True
+            cur.execute(
+                "INSERT INTO rate_limit_attempts (scope, key_hash, created_at) VALUES (%s, %s, %s)",
+                (scope, key_hash, datetime.now()),
+            )
+        connection.commit()
+        return False
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def rate_limited_html(template_name, retry_minutes, **context):
+    response = make_response(render_template(template_name, **context), 429)
+    response.headers["Retry-After"] = str(max(1, int(retry_minutes)) * 60)
+    return response
+
+
+def rate_limited_json(message, retry_minutes):
+    response = jsonify({"ok": False, "error": message})
+    response.status_code = 429
+    response.headers["Retry-After"] = str(max(1, int(retry_minutes)) * 60)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def login_is_rate_limited(email, ip_address):
     cutoff = datetime.now() - timedelta(minutes=LOGIN_WINDOW_MINUTES)
     row = db_query(
@@ -739,28 +855,6 @@ def record_login_attempt(email, ip_address, successful):
     )
     if successful:
         db_execute("DELETE FROM login_attempts WHERE LOWER(email) = LOWER(%s) AND successful = FALSE", (email,))
-
-
-def booking_is_rate_limited(salon_id, ip_address):
-    cutoff = datetime.now() - timedelta(minutes=BOOKING_WINDOW_MINUTES)
-    row = db_query(
-        """
-        SELECT COUNT(*) AS total FROM booking_attempts
-        WHERE salon_id = %s AND ip_address = %s AND created_at >= %s
-        """,
-        (salon_id, ip_address, cutoff),
-        one=True,
-    )
-    return bool(row and row["total"] >= BOOKING_MAX_REQUESTS)
-
-
-def record_booking_attempt(salon_id, ip_address):
-    cutoff = datetime.now() - timedelta(days=2)
-    db_execute("DELETE FROM booking_attempts WHERE created_at < %s", (cutoff,))
-    db_execute(
-        "INSERT INTO booking_attempts (salon_id, ip_address, created_at) VALUES (%s, %s, %s)",
-        (salon_id, ip_address, datetime.now()),
-    )
 
 
 def csrf_token():
@@ -788,6 +882,21 @@ def add_security_headers(response):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'",
+    )
     if request.is_secure:
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if session.get("user_id") or request.endpoint in {
@@ -804,12 +913,22 @@ def current_user():
     return db_query("SELECT * FROM users WHERE id = %s AND active = TRUE", (user_id,), one=True)
 
 
+def validated_session_user():
+    user = current_user()
+    if not user and session.get("user_id"):
+        session.clear()
+    return user
+
+
 def current_salon():
     user = current_user()
     if not user:
         return None
     if user["role"] == "super_admin" and session.get("impersonate_salon_id"):
-        return db_query("SELECT * FROM salons WHERE id = %s", (session["impersonate_salon_id"],), one=True)
+        salon = db_query("SELECT * FROM salons WHERE id = %s", (session["impersonate_salon_id"],), one=True)
+        if not salon:
+            session.pop("impersonate_salon_id", None)
+        return salon
     if not user.get("salon_id"):
         return None
     return db_query("SELECT * FROM salons WHERE id = %s", (user["salon_id"],), one=True)
@@ -966,7 +1085,7 @@ def subscription_label(value):
 def login_required(view):
     @wraps(view)
     def wrapped_view(*args, **kwargs):
-        if not session.get("user_id"):
+        if not validated_session_user():
             return redirect(url_for("login", next=request.path))
         return view(*args, **kwargs)
     return wrapped_view
@@ -975,14 +1094,26 @@ def login_required(view):
 def salon_required(view):
     @wraps(view)
     def wrapped_view(*args, **kwargs):
-        user = current_user()
+        user = validated_session_user()
         if not user:
             return redirect(url_for("login", next=request.path))
-        if user["role"] == "super_admin" and not session.get("impersonate_salon_id"):
-            return redirect(url_for("super_admin_dashboard"))
-        if not current_salon():
+        if user["role"] == "super_admin":
+            impersonate_salon_id = session.get("impersonate_salon_id")
+            if not impersonate_salon_id:
+                return redirect(url_for("super_admin_dashboard"))
+            salon = db_query("SELECT * FROM salons WHERE id = %s", (impersonate_salon_id,), one=True)
+            if not salon:
+                session.pop("impersonate_salon_id", None)
+                flash("Salon koji ste gledali vise ne postoji.", "warning")
+                return redirect(url_for("super_admin_dashboard"))
+        elif not user.get("salon_id") or not db_query(
+            "SELECT id FROM salons WHERE id = %s",
+            (user.get("salon_id"),),
+            one=True,
+        ):
+            session.clear()
             flash("Salon nije pronadjen za ovaj nalog.", "error")
-            return redirect(url_for("logout"))
+            return redirect(url_for("login"))
         return view(*args, **kwargs)
     return wrapped_view
 
@@ -1001,12 +1132,21 @@ def subscription_required(view):
 def super_admin_required(view):
     @wraps(view)
     def wrapped_view(*args, **kwargs):
-        user = current_user()
+        user = validated_session_user()
         if not user:
             return redirect(url_for("login", next=request.path))
         if user["role"] != "super_admin":
             flash("Nemate pristup super admin panelu.", "error")
             return redirect(url_for("dashboard"))
+        impersonate_salon_id = session.get("impersonate_salon_id")
+        if impersonate_salon_id and not db_query(
+            "SELECT id FROM salons WHERE id = %s",
+            (impersonate_salon_id,),
+            one=True,
+        ):
+            session.pop("impersonate_salon_id", None)
+            flash("Salon koji ste gledali vise ne postoji.", "warning")
+            return redirect(url_for("super_admin_dashboard"))
         return view(*args, **kwargs)
     return wrapped_view
 
@@ -1203,6 +1343,11 @@ def appointment_conflict(
     if exclude_id:
         sql += " AND a.id != %s"
         params.append(exclude_id)
+    if cursor is not None:
+        # The worker row is the primary serialization lock. Lock matching
+        # appointment rows as an additional safeguard against concurrent
+        # cancellation, deletion, or status changes during the final check.
+        sql += " FOR UPDATE OF a"
     for row in query_rows(sql, params, cursor=cursor):
         existing_start = time_to_minutes(row["time"])
         existing_end = existing_start + int(row.get("duration_minutes") or 30)
@@ -1677,7 +1822,7 @@ def persist_appointment_locked(
 
 @app.route("/")
 def home():
-    user = current_user()
+    user = validated_session_user()
     if user and user["role"] == "super_admin" and not session.get("impersonate_salon_id"):
         return redirect(url_for("super_admin_dashboard"))
     if user:
@@ -1688,15 +1833,24 @@ def home():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if session.get("user_id"):
-        return redirect(url_for("home"))
+        if validated_session_user():
+            return redirect(url_for("home"))
 
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
         ip_address = request_ip()
+        if rate_limit_exceeded(
+            "login-request",
+            ip_address,
+            LOGIN_REQUEST_MAX_ATTEMPTS,
+            LOGIN_WINDOW_MINUTES,
+        ):
+            flash(f"Previse pokusaja prijave. Pokusajte ponovo za {LOGIN_WINDOW_MINUTES} minuta.", "error")
+            return rate_limited_html("login.html", LOGIN_WINDOW_MINUTES)
         if login_is_rate_limited(email, ip_address):
             flash(f"Previse neuspesnih pokusaja. Pokusajte ponovo za {LOGIN_WINDOW_MINUTES} minuta.", "error")
-            return render_template("login.html"), 429
+            return rate_limited_html("login.html", LOGIN_WINDOW_MINUTES)
 
         user = db_query("SELECT * FROM users WHERE LOWER(email) = LOWER(%s) AND active = TRUE", (email,), one=True)
         successful = bool(user and check_password_hash(user["password_hash"], password))
@@ -1707,9 +1861,7 @@ def login():
             session["user_id"] = user["id"]
             session["user_role"] = user["role"]
             session["salon_id"] = user["salon_id"]
-            next_url = request.args.get("next") or url_for("home")
-            if not next_url.startswith("/"):
-                next_url = url_for("home")
+            next_url = safe_local_redirect(request.args.get("next")) or url_for("home")
             flash("Uspesno ste se prijavili.", "success")
             return redirect(next_url)
         flash("Pogresan email ili sifra.", "error")
@@ -1855,6 +2007,17 @@ def resend_verification():
 def forgot_password():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
+        if rate_limit_exceeded(
+            "password-reset",
+            request_ip(),
+            PASSWORD_RESET_MAX_REQUESTS,
+            PASSWORD_RESET_WINDOW_MINUTES,
+        ):
+            flash(
+                f"Previse zahteva. Pokusajte ponovo za {PASSWORD_RESET_WINDOW_MINUTES} minuta.",
+                "error",
+            )
+            return rate_limited_html("forgot_password.html", PASSWORD_RESET_WINDOW_MINUTES)
         user = db_query("SELECT * FROM users WHERE LOWER(email) = LOWER(%s) AND active = TRUE", (email,), one=True)
         if user:
             token = create_signed_token("reset-password", user)
@@ -1890,7 +2053,7 @@ def reset_password(token):
     return render_template("reset_password.html", token=token)
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
     session.clear()
     flash("Odjavljeni ste.", "info")
@@ -3313,6 +3476,16 @@ def public_available_dates(slug):
     salon = db_query("SELECT * FROM salons WHERE slug = %s", (slug,), one=True)
     if not salon or not subscription_is_allowed(salon):
         return jsonify({"ok": False, "error": "Zakazivanje trenutno nije dostupno."}), 404
+    if rate_limit_exceeded(
+        "public-availability",
+        f"{salon['id']}:{request_ip()}",
+        AVAILABILITY_MAX_REQUESTS,
+        AVAILABILITY_WINDOW_MINUTES,
+    ):
+        return rate_limited_json(
+            "Previse zahteva za slobodne termine. Pokusajte ponovo kasnije.",
+            AVAILABILITY_WINDOW_MINUTES,
+        )
     try:
         service_id = int(request.args.get("service_id", ""))
         worker_id = int(request.args.get("worker_id", ""))
@@ -3339,6 +3512,16 @@ def public_availability(slug):
     salon = db_query("SELECT * FROM salons WHERE slug = %s", (slug,), one=True)
     if not salon or not subscription_is_allowed(salon):
         return jsonify({"ok": False, "error": "Zakazivanje trenutno nije dostupno."}), 404
+    if rate_limit_exceeded(
+        "public-availability",
+        f"{salon['id']}:{request_ip()}",
+        AVAILABILITY_MAX_REQUESTS,
+        AVAILABILITY_WINDOW_MINUTES,
+    ):
+        return rate_limited_json(
+            "Previse zahteva za slobodne termine. Pokusajte ponovo kasnije.",
+            AVAILABILITY_WINDOW_MINUTES,
+        )
     try:
         service_id = int(request.args.get("service_id", ""))
         worker_id = int(request.args.get("worker_id", ""))
@@ -3364,13 +3547,21 @@ def public_booking(slug):
     salon_id = salon["id"]
     if request.method == "POST":
         ip_address = request_ip()
-        if booking_is_rate_limited(salon_id, ip_address):
+        if rate_limit_exceeded(
+            "public-booking-submit",
+            f"{salon_id}:{ip_address}",
+            BOOKING_MAX_REQUESTS,
+            BOOKING_WINDOW_MINUTES,
+        ):
             flash(
                 f"Poslato je previše zahteva. Pokušajte ponovo za {BOOKING_WINDOW_MINUTES} minuta ili pozovite salon.",
                 "error",
             )
-            return render_template("booking.html", **public_booking_context(salon, dict(request.form))), 429
-        record_booking_attempt(salon_id, ip_address)
+            return rate_limited_html(
+                "booking.html",
+                BOOKING_WINDOW_MINUTES,
+                **public_booking_context(salon, dict(request.form)),
+            )
         client_name = request.form.get("client_name", "").strip()
         client_phone = request.form.get("client_phone", "").strip()
         client_email = request.form.get("client_email", "").strip().lower()
@@ -3752,7 +3943,7 @@ def super_admin_impersonate(salon_id):
     return redirect(url_for("dashboard"))
 
 
-@app.route("/super-admin/stop-impersonating")
+@app.route("/super-admin/stop-impersonating", methods=["POST"])
 @super_admin_required
 def super_admin_stop_impersonating():
     session.pop("impersonate_salon_id", None)
@@ -3764,8 +3955,9 @@ def not_found(error):
     return render_template("404.html"), 404
 
 
-with app.app_context():
-    init_db()
+if os.environ.get("SALONPANEL_SKIP_DB_INIT") != "1":
+    with app.app_context():
+        init_db()
 
 
 if __name__ == "__main__":

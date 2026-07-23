@@ -61,6 +61,14 @@ document.addEventListener("DOMContentLoaded", function () {
         });
     });
 
+    document.querySelectorAll(".auto-submit").forEach(function (input) {
+        input.addEventListener("change", function () {
+            if (input.form) {
+                input.form.submit();
+            }
+        });
+    });
+
     document.querySelectorAll(".service-assignment-checkbox").forEach(function (checkbox) {
         function syncAssignmentRow() {
             var row = checkbox.closest(".assignment-row");

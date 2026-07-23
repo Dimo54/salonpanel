@@ -21,7 +21,7 @@
             <h2>{{ month_start.strftime('%m.%Y') }}</h2>
             <form method="get" class="calendar-filter">
                 <input type="hidden" name="month" value="{{ month_start.strftime('%Y-%m') }}">
-                <select name="worker_id" onchange="this.form.submit()">
+                <select class="auto-submit" name="worker_id">
                     <option value="">Svi radnici</option>
                     {% for worker in workers %}
                     <option value="{{ worker.id }}" {% if worker_filter|string == worker.id|string %}selected{% endif %}>{{ worker.name }}</option>
@@ -62,6 +62,7 @@
             </div>
         </div>
         <form method="post" class="form-stack" id="timeOffForm">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label>
                 Radnik
                 <select name="worker_id" required>
@@ -115,6 +116,7 @@
                     {% if absence.reason %}<small>{{ absence.reason }}</small>{% endif %}
                 </div>
                 <form method="post" action="{{ url_for('worker_time_off_delete', time_off_id=absence.id) }}" data-confirm="Ukloniti odsustvo?">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button class="btn btn-mini btn-ghost" type="submit">Ukloni</button>
                 </form>
             </div>
