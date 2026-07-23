@@ -870,6 +870,13 @@ def protect_csrf():
     if request.endpoint == "send_reminders_task":
         return None
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if (
+            request.method == "POST"
+            and request.endpoint == "login"
+            and session.get("user_id")
+            and validated_session_user()
+        ):
+            return redirect(url_for("home"))
         expected = session.get("csrf_token")
         supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token")
         if not expected or not supplied or not secrets.compare_digest(str(expected), str(supplied)):

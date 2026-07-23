@@ -12,6 +12,21 @@ document.addEventListener("DOMContentLoaded", function () {
             }
         });
     }
+    document.querySelectorAll("form[data-prevent-duplicate-submit]").forEach(function (form) {
+        var submitted = false;
+        form.addEventListener("submit", function (event) {
+            if (submitted) {
+                event.preventDefault();
+                return;
+            }
+            submitted = true;
+            var submitButton = event.submitter || form.querySelector('[type="submit"]');
+            if (submitButton) {
+                submitButton.disabled = true;
+                submitButton.setAttribute("aria-busy", "true");
+            }
+        });
+    });
     var sidebar = document.getElementById("appSidebar");
     var navToggle = document.getElementById("mobileNavToggle");
     var navClose = document.getElementById("mobileNavClose");
