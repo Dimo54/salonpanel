@@ -41,6 +41,7 @@
             {% endwith %}
 
             <form method="post" class="form-stack">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <label>
                     Naziv salona
                     <input type="text" name="salon_name" value="{{ request.form.get('salon_name', '') }}" placeholder="npr. Studio Ana" required>

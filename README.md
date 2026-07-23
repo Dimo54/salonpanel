@@ -167,11 +167,31 @@ CRON_SECRET=druga_duga_nasumicna_vrednost
 ```text
 LOGIN_MAX_ATTEMPTS=5
 LOGIN_WINDOW_MINUTES=15
+LOGIN_REQUEST_MAX_ATTEMPTS=20
+PASSWORD_RESET_MAX_REQUESTS=5
+PASSWORD_RESET_WINDOW_MINUTES=30
+AVAILABILITY_MAX_REQUESTS=60
+AVAILABILITY_WINDOW_MINUTES=10
 BOOKING_MAX_REQUESTS=8
 BOOKING_WINDOW_MINUTES=30
+RATE_LIMIT_RETENTION_HOURS=48
+RATE_LIMIT_CLEANUP_BATCH_SIZE=500
 ```
 
-Prve dve vrednosti privremeno zaustavljaju veliki broj pogrešnih pokušaja prijave sa iste internet adrese. Druge dve ograničavaju spam javnog obrasca za zakazivanje sa iste internet adrese.
+Ove vrednosti ograničavaju veliki broj zahteva za prijavu, promenu zaboravljene šifre, proveru slobodnih termina i slanje javnog obrasca sa iste internet adrese. Podrazumevane vrednosti su dovoljno visoke za normalno korišćenje javnog formulara, ali zaustavljaju automatizovano ponavljanje zahteva.
+
+Nova generička tabela `rate_limit_attempts` čuva HMAC identifikatore umesto sirovih identifikatora zahteva. Njeni zapisi se zadržavaju 48 sati, a pri svakom novom generički ograničenom zahtevu briše se najviše 500 najstarijih isteklih zapisa. Postojeća zaštita neuspešne prijave u tabeli `login_attempts` i dalje privremeno beleži email i internet adresu radi otkrivanja ponovljenih pokušaja, a zapise starije od dva dana briše tokom narednih pokušaja prijave. Ovo je u skladu sa Politikom privatnosti, koja navodi kratkotrajno beleženje tehničkih podataka radi sprečavanja zloupotrebe.
+
+Kontrolisana SQL migracija za novu generičku tabelu i indekse nalazi se u `migrations/20260723_create_rate_limit_attempts.sql`. Izvršavanje te migracije kao posebnog koraka pre pokretanja nove verzije je preporučeni postupak za produkciju. Postojeća inicijalizacija šeme pri pokretanju aplikacije privremeno ostaje prisutna radi kompatibilnosti sa ranijim instalacijama.
+
+## Lokalno pokretanje testova
+
+Testovi ne pokreću inicijalizaciju baze i ne zahtevaju vezu sa Supabase projektom:
+
+```bash
+SALONPANEL_SKIP_DB_INIT=1 SECRET_KEY=test-secret-key DATABASE_URL=postgresql://test:test@localhost/test \
+python -m unittest discover -s tests -v
+```
 
 ## Render podešavanja
 

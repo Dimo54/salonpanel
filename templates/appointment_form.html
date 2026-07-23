@@ -12,6 +12,7 @@
 
 <section class="panel form-panel">
     <form method="post" class="smart-form" id="appointmentForm" data-selected-worker="{{ appointment.get('worker_id', '') }}" data-mode="{{ mode }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-grid">
             <label>
                 Ime klijenta

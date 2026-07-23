@@ -11,6 +11,7 @@
 </div>
 
 <form method="post" class="smart-form settings-page-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <section class="panel form-panel">
         <div class="panel-head">
             <div>

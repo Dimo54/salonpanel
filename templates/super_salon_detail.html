@@ -10,6 +10,7 @@
     <div class="head-actions">
         <a class="btn btn-secondary" href="{{ url_for('public_booking', slug=salon.slug) }}" target="_blank">Javni link</a>
         <form method="post" action="{{ url_for('super_admin_impersonate', salon_id=salon.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn btn-primary" type="submit">Otvori kao salon</button>
         </form>
     </div>
@@ -48,6 +49,7 @@
         <h2>Pretplata</h2>
         <p>Do Paddle integracije status se moze rucno menjati ovde. Kasnije ce ovo automatski raditi webhook nakon placanja.</p>
         <form method="post" action="{{ url_for('super_admin_update_subscription', salon_id=salon.id) }}" class="smart-form">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="form-grid single">
                 <label>
                     Status

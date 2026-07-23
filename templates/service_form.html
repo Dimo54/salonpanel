@@ -12,6 +12,7 @@
 
 <section class="panel form-panel narrow">
     <form method="post" class="smart-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="form-grid single">
             <label>
                 Naziv usluge

@@ -30,9 +30,11 @@
         <div class="actions service-actions">
             <a class="btn btn-mini" href="{{ url_for('service_edit', service_id=service.id) }}">Izmeni</a>
             <form method="post" action="{{ url_for('service_toggle', service_id=service.id) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="btn btn-mini btn-secondary" type="submit">{% if service.active %}Deaktiviraj{% else %}Aktiviraj{% endif %}</button>
             </form>
             <form method="post" action="{{ url_for('service_delete', service_id=service.id) }}" data-confirm="Obrisati uslugu?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <button class="btn btn-mini btn-ghost" type="submit">Obrisi</button>
             </form>
         </div>

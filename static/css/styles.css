@@ -145,6 +145,13 @@ button, input, textarea, select {
 }
 
 .logout-link {
+    appearance: none;
+    width: 100%;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
     padding: 12px 14px;
     color: var(--muted);
     border-radius: 14px;
@@ -153,6 +160,10 @@ button, input, textarea, select {
 .logout-link:hover {
     background: rgba(255, 255, 255, 0.08);
     color: white;
+}
+
+.logout-form {
+    margin-top: auto;
 }
 
 .main-content {

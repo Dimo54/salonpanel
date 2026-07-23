@@ -68,7 +68,12 @@
             </div>
             {% else %}
             {% if current_user and current_user.role == 'super_admin' and current_salon %}
-            <div class="flash flash-info">Gledate salon kao super admin. <a href="{{ url_for('super_admin_stop_impersonating') }}">Nazad na super admin</a></div>
+            <div class="flash flash-info">Gledate salon kao super admin.
+                <form method="post" action="{{ url_for('super_admin_stop_impersonating') }}" class="inline-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="link-button" type="submit">Nazad na super admin</button>
+                </form>
+            </div>
             {% endif %}
             <nav class="nav-list">
                 <a class="nav-link {% if request.endpoint == 'dashboard' %}active{% endif %}" href="{{ url_for('dashboard') }}">Dashboard</a>
@@ -92,7 +97,10 @@
             {% endif %}
 
             {% if current_user %}
-            <a class="logout-link" href="{{ url_for('logout') }}">Odjava</a>
+            <form method="post" action="{{ url_for('logout') }}" class="logout-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="logout-link" type="submit">Odjava</button>
+            </form>
             {% endif %}
         </aside>
 
@@ -111,6 +119,7 @@
             <div class="flash flash-warning verification-banner">
                 Email adresa naloga nije potvrđena. Potvrda štiti nalog i omogućava pouzdan reset lozinke.
                 <form method="post" action="{{ url_for('resend_verification') }}" class="inline-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button class="link-button" type="submit">Pošalji verifikacioni email ponovo</button>
                 </form>
             </div>
