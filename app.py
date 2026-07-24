@@ -36,6 +36,7 @@ from email_service import (
     send_auth_email,
     send_salon_new_request,
 )
+from phone_utils import normalize_phone
 
 APP_NAME = "SalonPanel"
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
@@ -1220,62 +1221,49 @@ def parse_price(value, fallback=0):
         return float(fallback or 0)
 
 
-def get_or_create_client(salon_id, name, phone=None, email=None, notes=None, privacy_consent=False, marketing_consent=False):
-    name = (name or "").strip()
-    phone = (phone or "").strip()
-    email = (email or "").strip().lower()
-    notes = (notes or "").strip()
-    consent_at = datetime.now() if privacy_consent else None
+def client_advisory_lock_key(normalized_phone):
+    digest = hashlib.sha256(
+        f"salonpanel:client-resolution:{normalized_phone}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=True)
 
-    if phone:
-        existing = db_query(
-            "SELECT * FROM clients WHERE salon_id = %s AND phone = %s",
-            (salon_id, phone),
-            one=True,
-        )
-        if existing:
-            db_execute(
-                """
-                UPDATE clients
-                SET name = COALESCE(NULLIF(%s, ''), name),
-                    email = COALESCE(NULLIF(%s, ''), email),
-                    privacy_consent_at = COALESCE(privacy_consent_at, %s),
-                    marketing_consent = marketing_consent OR %s
-                WHERE id = %s AND salon_id = %s
-                """,
-                (name, email, consent_at, marketing_consent, existing["id"], salon_id),
-            )
-            return existing["id"]
 
-    existing_by_name = db_query(
-        "SELECT * FROM clients WHERE salon_id = %s AND LOWER(name) = LOWER(%s)",
-        (salon_id, name),
-        one=True,
+def resolve_client_for_appointment(cursor, salon_id, name, phone, normalized_phone, email):
+    # Serialize matching and insertion so concurrent bookings cannot create the
+    # same canonical client through an unlocked check-then-insert sequence.
+    cursor.execute(
+        "SELECT pg_advisory_xact_lock(%s, %s)",
+        (int(salon_id), client_advisory_lock_key(normalized_phone)),
     )
-    if existing_by_name:
-        db_execute(
-            """
-            UPDATE clients
-            SET phone = COALESCE(NULLIF(%s, ''), phone),
-                email = COALESCE(NULLIF(%s, ''), email),
-                privacy_consent_at = COALESCE(privacy_consent_at, %s),
-                marketing_consent = marketing_consent OR %s
-            WHERE id = %s AND salon_id = %s
-            """,
-            (phone, email, consent_at, marketing_consent, existing_by_name["id"], salon_id),
-        )
-        return existing_by_name["id"]
-
-    row = db_execute(
+    cursor.execute(
         """
-        INSERT INTO clients (salon_id, name, phone, email, notes, privacy_consent_at, marketing_consent)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        SELECT id
+        FROM clients
+        WHERE salon_id = %s
+          AND phone_normalized = %s
+          AND LOWER(COALESCE(email, '')) = %s
+        ORDER BY id
+        """,
+        (salon_id, normalized_phone, email),
+    )
+    matches = cursor.fetchall()
+    if len(matches) == 1:
+        return matches[0]["id"], False
+
+    cursor.execute(
+        """
+        INSERT INTO clients
+            (salon_id, name, phone, phone_normalized, email, notes,
+             privacy_consent_at, marketing_consent)
+        VALUES (%s, %s, %s, %s, %s, NULL, NULL, FALSE)
         RETURNING id
         """,
-        (salon_id, name, phone, email, notes, consent_at, marketing_consent),
-        returning=True,
+        (salon_id, name, phone, normalized_phone, email),
     )
-    return row["id"]
+    created = cursor.fetchone()
+    if not created:
+        raise RuntimeError("Kreiranje klijenta nije uspelo.")
+    return created["id"], True
 
 
 def query_rows(query, args=None, one=False, cursor=None):
@@ -1750,7 +1738,6 @@ def available_dates_for_worker(salon, worker_id, service_id, start_date=None, da
 
 def persist_appointment_locked(
     salon,
-    client_id,
     service_id,
     worker_id,
     appointment_date,
@@ -1760,6 +1747,15 @@ def persist_appointment_locked(
     status,
     source,
     notes,
+    *,
+    client_id=None,
+    contact_name=None,
+    contact_phone=None,
+    contact_phone_normalized=None,
+    contact_email=None,
+    contact_source=None,
+    privacy_consent=False,
+    marketing_consent=False,
     appointment_id=None,
     public_request=False,
     public_token=None,
@@ -1805,36 +1801,89 @@ def persist_appointment_locked(
 
             now = datetime.now()
             if appointment_id:
-                cur.execute(
-                    """
-                    UPDATE appointments
-                    SET client_id = %s, service_id = %s, worker_id = %s, date = %s, time = %s,
-                        duration_minutes = %s, price = %s, status = %s, notes = %s, updated_at = %s
-                    WHERE id = %s AND salon_id = %s
-                    RETURNING id
-                    """,
-                    (
-                        client_id,
-                        service_id,
-                        worker_id,
-                        appointment_date,
-                        appointment_time,
-                        duration_minutes,
-                        price,
-                        status,
-                        notes,
-                        now,
-                        appointment_id,
-                        salon["id"],
-                    ),
-                )
+                if client_id is None:
+                    connection.rollback()
+                    return None, "Termin nije pronadjen."
+                if contact_source:
+                    cur.execute(
+                        """
+                        UPDATE appointments
+                        SET client_id = %s, service_id = %s, worker_id = %s, date = %s, time = %s,
+                            duration_minutes = %s, price = %s, status = %s, notes = %s,
+                            contact_name = %s, contact_phone = %s, contact_phone_normalized = %s,
+                            contact_email = %s, contact_source = %s, updated_at = %s
+                        WHERE id = %s AND salon_id = %s
+                        RETURNING id
+                        """,
+                        (
+                            client_id,
+                            service_id,
+                            worker_id,
+                            appointment_date,
+                            appointment_time,
+                            duration_minutes,
+                            price,
+                            status,
+                            notes,
+                            contact_name,
+                            contact_phone,
+                            contact_phone_normalized,
+                            contact_email,
+                            contact_source,
+                            now,
+                            appointment_id,
+                            salon["id"],
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE appointments
+                        SET client_id = %s, service_id = %s, worker_id = %s, date = %s, time = %s,
+                            duration_minutes = %s, price = %s, status = %s, notes = %s, updated_at = %s
+                        WHERE id = %s AND salon_id = %s
+                        RETURNING id
+                        """,
+                        (
+                            client_id,
+                            service_id,
+                            worker_id,
+                            appointment_date,
+                            appointment_time,
+                            duration_minutes,
+                            price,
+                            status,
+                            notes,
+                            now,
+                            appointment_id,
+                            salon["id"],
+                        ),
+                    )
             else:
+                if (
+                    not contact_name
+                    or not contact_phone
+                    or not contact_phone_normalized
+                    or contact_source not in ("public_submission", "admin_submission")
+                ):
+                    raise ValueError("Podaci kontakta za termin nisu potpuni.")
+                client_id, _ = resolve_client_for_appointment(
+                    cur,
+                    salon["id"],
+                    contact_name,
+                    contact_phone,
+                    contact_phone_normalized,
+                    contact_email or "",
+                )
                 cur.execute(
                     """
                     INSERT INTO appointments
                         (salon_id, client_id, service_id, worker_id, date, time, duration_minutes,
-                         price, status, source, notes, created_at, updated_at, public_token)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         price, status, source, notes, created_at, updated_at, public_token,
+                         contact_name, contact_phone, contact_phone_normalized, contact_email,
+                         contact_source, privacy_consent_at, marketing_consent)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -1852,12 +1901,20 @@ def persist_appointment_locked(
                         now,
                         now,
                         public_token,
+                        contact_name,
+                        contact_phone,
+                        contact_phone_normalized,
+                        contact_email or "",
+                        contact_source,
+                        now if privacy_consent else None,
+                        bool(marketing_consent),
                     ),
                 )
             row = cur.fetchone()
+            if not row:
+                connection.rollback()
+                return None, "Termin nije pronadjen."
         connection.commit()
-        if not row:
-            return None, "Termin nije pronadjen."
         return row["id"], None
     except Exception:
         connection.rollback()
@@ -2387,6 +2444,9 @@ def save_appointment(appointment_id=None):
     previous = None
     if appointment_id:
         previous = db_query("SELECT * FROM appointments WHERE id = %s AND salon_id = %s", (appointment_id, salon_id), one=True)
+        if not previous:
+            flash("Termin nije pronadjen.", "error")
+            return None
 
     client_name = request.form.get("client_name", "").strip()
     client_phone = request.form.get("client_phone", "").strip()
@@ -2405,6 +2465,10 @@ def save_appointment(appointment_id=None):
     if client_email and not valid_email(client_email):
         flash("Email klijenta nije ispravan.", "error")
         return None
+    client_phone_normalized, phone_error = normalize_phone(client_phone)
+    if phone_error:
+        flash("Unesite ispravan broj telefona.", "error")
+        return None
     if status not in STATUS_LABELS:
         flash("Status termina nije ispravan.", "error")
         return None
@@ -2421,10 +2485,8 @@ def save_appointment(appointment_id=None):
 
     duration_minutes = int(assignment["worker_duration_minutes"] or 30)
     price = max(0.0, parse_price(request.form.get("price"), fallback=assignment["worker_price"]))
-    client_id = get_or_create_client(salon_id, client_name, client_phone, client_email)
     saved_id, error = persist_appointment_locked(
         salon,
-        client_id,
         int(service_id),
         int(worker_id),
         appointment_date,
@@ -2434,6 +2496,12 @@ def save_appointment(appointment_id=None):
         status,
         "admin",
         notes,
+        client_id=previous["client_id"] if previous else None,
+        contact_name=client_name,
+        contact_phone=client_phone,
+        contact_phone_normalized=client_phone_normalized,
+        contact_email=client_email,
+        contact_source="admin_submission",
         appointment_id=appointment_id,
     )
     if error:
@@ -2534,7 +2602,6 @@ def appointment_status(appointment_id):
     if new_status in ("pending", "scheduled"):
         _, error = persist_appointment_locked(
             salon,
-            appointment["client_id"],
             appointment["service_id"],
             appointment["worker_id"],
             appointment["date"],
@@ -2544,6 +2611,7 @@ def appointment_status(appointment_id):
             new_status,
             appointment["source"],
             appointment.get("notes") or "",
+            client_id=appointment["client_id"],
             appointment_id=appointment_id,
         )
         if error:
@@ -3652,24 +3720,19 @@ def public_booking(slug):
         if not privacy_accepted:
             flash("Morate prihvatiti Politiku privatnosti da bi salon obradio zahtev za termin.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
+        client_phone_normalized, phone_error = normalize_phone(client_phone)
+        if phone_error:
+            flash("Unesite ispravan broj telefona.", "error")
+            return render_template("booking.html", **public_booking_context(salon, form_data))
 
         assignment = worker_service_assignment(salon_id, worker_id, service_id, active_only=True)
         if not assignment:
             flash("Izabrani radnik trenutno ne pruza ovu uslugu.", "error")
             return render_template("booking.html", **public_booking_context(salon, form_data))
 
-        client_id = get_or_create_client(
-            salon_id,
-            client_name,
-            client_phone,
-            client_email,
-            privacy_consent=True,
-            marketing_consent=marketing_accepted,
-        )
         status = "scheduled" if salon.get("booking_mode") == "automatic" else "pending"
         appointment_id, error = persist_appointment_locked(
             salon,
-            client_id,
             service_id,
             worker_id,
             appointment_date,
@@ -3679,6 +3742,13 @@ def public_booking(slug):
             status,
             "public",
             notes,
+            contact_name=client_name,
+            contact_phone=client_phone,
+            contact_phone_normalized=client_phone_normalized,
+            contact_email=client_email,
+            contact_source="public_submission",
+            privacy_consent=True,
+            marketing_consent=marketing_accepted,
             public_request=True,
             public_token=secrets.token_urlsafe(24),
         )

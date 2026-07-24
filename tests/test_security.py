@@ -494,7 +494,6 @@ class SecurityTests(unittest.TestCase):
 
         def persist_conflicting_appointment(
             selected_salon,
-            client_id,
             service_id,
             worker_id,
             appointment_date,
@@ -525,7 +524,6 @@ class SecurityTests(unittest.TestCase):
                 "worker_service_assignment",
                 return_value={"worker_duration_minutes": 30, "worker_price": 1000},
             ),
-            patch.object(salon_app, "get_or_create_client", return_value=77),
             patch.object(
                 salon_app,
                 "persist_appointment_locked",
@@ -567,7 +565,7 @@ class SecurityTests(unittest.TestCase):
                 "/s/test-salon/zakazi",
                 data={
                     "client_name": "Novi Klijent",
-                    "client_phone": "060000000",
+                    "client_phone": "0611234567",
                     "client_email": "new@example.com",
                     "service_id": "3",
                     "worker_id": "4",

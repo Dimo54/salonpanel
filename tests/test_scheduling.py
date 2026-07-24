@@ -255,7 +255,6 @@ class SchedulingTests(unittest.TestCase):
         ):
             appointment_id, error = salon_app.persist_appointment_locked(
                 self.salon,
-                client_id=10,
                 service_id=3,
                 worker_id=2,
                 appointment_date=self.future_date,
@@ -265,8 +264,9 @@ class SchedulingTests(unittest.TestCase):
                 status="scheduled",
                 source="public",
                 notes="",
+                client_id=10,
+                appointment_id=8,
                 public_request=True,
-                public_token="public-token",
             )
         self.assertEqual(appointment_id, 99)
         self.assertIsNone(error)
@@ -290,7 +290,6 @@ class SchedulingTests(unittest.TestCase):
         ):
             appointment_id, error = salon_app.persist_appointment_locked(
                 self.salon,
-                client_id=10,
                 service_id=3,
                 worker_id=2,
                 appointment_date=self.future_date,
@@ -300,6 +299,8 @@ class SchedulingTests(unittest.TestCase):
                 status="scheduled",
                 source="public",
                 notes="",
+                client_id=10,
+                appointment_id=8,
             )
         self.assertIsNone(appointment_id)
         self.assertIn("aktivan termin", error)
