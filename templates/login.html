@@ -40,7 +40,7 @@
                 {% endif %}
             {% endwith %}
 
-            <form method="post" class="form-stack">
+            <form method="post" class="form-stack" data-prevent-duplicate-submit>
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 <label>
                     Email

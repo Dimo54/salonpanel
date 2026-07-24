@@ -218,9 +218,85 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(response.headers["Cross-Origin-Opener-Policy"], "same-origin")
         self.assertEqual(response.headers["Cross-Origin-Resource-Policy"], "same-origin")
 
-    def test_csrf_rejects_unprotected_post(self):
-        response = self.client.post("/login", data={"email": "test@example.com", "password": "x"})
+    def test_csrf_rejects_unauthenticated_login_post_with_missing_or_invalid_token(self):
+        with self.client.session_transaction() as session:
+            session["csrf_token"] = "expected-csrf-token"
+        for supplied_token in (None, "invalid-csrf-token"):
+            with self.subTest(supplied_token=supplied_token):
+                data = {"email": "test@example.com", "password": "x"}
+                if supplied_token is not None:
+                    data["csrf_token"] = supplied_token
+                response = self.client.post("/login", data=data)
+                self.assertEqual(response.status_code, 400)
+
+    def test_authenticated_duplicate_login_post_redirects_without_authentication_work(self):
+        user = {"id": 7, "salon_id": 3, "role": "owner", "active": True}
+        with self.client.session_transaction() as session:
+            session["user_id"] = user["id"]
+            session["user_role"] = user["role"]
+            session["salon_id"] = user["salon_id"]
+        with (
+            patch.object(salon_app, "db_query", return_value=user) as db_query,
+            patch.object(salon_app, "rate_limit_exceeded") as request_rate_limiter,
+            patch.object(salon_app, "login_is_rate_limited") as login_rate_limiter,
+            patch.object(salon_app, "record_login_attempt") as record_attempt,
+            patch.object(salon_app, "check_password_hash") as check_password,
+        ):
+            response = self.client.post(
+                "/login",
+                data={
+                    "email": "test@example.com",
+                    "password": "correct-password",
+                    "csrf_token": "csrf-token-from-completed-login",
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/")
+        db_query.assert_called_once()
+        self.assertIn("active = TRUE", db_query.call_args.args[0])
+        request_rate_limiter.assert_not_called()
+        login_rate_limiter.assert_not_called()
+        record_attempt.assert_not_called()
+        check_password.assert_not_called()
+        with self.client.session_transaction() as session:
+            self.assertEqual(session["user_id"], user["id"])
+
+    def test_stale_or_inactive_session_does_not_bypass_login_csrf(self):
+        with self.client.session_transaction() as session:
+            session["user_id"] = 999
+            session["user_role"] = "owner"
+            session["salon_id"] = 10
+            session["csrf_token"] = "expected-csrf-token"
+        with (
+            patch.object(salon_app, "db_query", return_value=None) as db_query,
+            patch.object(salon_app, "rate_limit_exceeded") as request_rate_limiter,
+            patch.object(salon_app, "login_is_rate_limited") as login_rate_limiter,
+            patch.object(salon_app, "record_login_attempt") as record_attempt,
+        ):
+            response = self.client.post(
+                "/login",
+                data={
+                    "email": "test@example.com",
+                    "password": "x",
+                    "csrf_token": "invalid-csrf-token",
+                },
+            )
         self.assertEqual(response.status_code, 400)
+        db_query.assert_called_once()
+        self.assertIn("active = TRUE", db_query.call_args.args[0])
+        request_rate_limiter.assert_not_called()
+        login_rate_limiter.assert_not_called()
+        record_attempt.assert_not_called()
+        with self.client.session_transaction() as session:
+            self.assertNotIn("user_id", session)
+
+    def test_rendered_login_form_opts_in_to_duplicate_submit_prevention(self):
+        response = self.client.get("/login")
+        self.assertEqual(response.status_code, 200)
+        self.assertRegex(
+            response.get_data(as_text=True),
+            r"<form\b[^>]*\bdata-prevent-duplicate-submit(?:[=\s>])",
+        )
 
     def test_stale_session_on_login_is_cleared_without_redirect_loop(self):
         with self.client.session_transaction() as session:
