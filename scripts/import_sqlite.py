@@ -6,14 +6,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datetime import date, timedelta
-from werkzeug.security import generate_password_hash
 
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
-DEFAULT_OWNER_PASSWORD = os.environ.get("IMPORT_OWNER_PASSWORD", "PromeniMe123!")
+
+
+def import_owner_password():
+    password = os.environ.get("IMPORT_OWNER_PASSWORD", "")
+    if not password.strip():
+        raise SystemExit(
+            "IMPORT_OWNER_PASSWORD is required. Provide an explicit temporary import credential."
+        )
+    return password
 
 
 def usage():
-    print("Usage: DATABASE_URL=postgresql://... python scripts/import_sqlite.py salonpanel.sqlite3 'Naziv salona' 'email@salona.com' 'Ime vlasnika'")
+    print(
+        "Usage: DATABASE_URL=postgresql://... IMPORT_OWNER_PASSWORD=... "
+        "python scripts/import_sqlite.py salonpanel.sqlite3 "
+        "'Naziv salona' 'email@salona.com' 'Ime vlasnika'"
+    )
     raise SystemExit(1)
 
 
@@ -27,9 +38,11 @@ def main():
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise SystemExit("DATABASE_URL is required")
+    owner_password = import_owner_password()
     if not sqlite_path.exists():
         raise SystemExit(f"SQLite file not found: {sqlite_path}")
 
+    from werkzeug.security import generate_password_hash
     import app as salon_app
 
     with salon_app.app.app_context():
@@ -50,7 +63,7 @@ def main():
             INSERT INTO users (salon_id, role, name, email, password_hash, active)
             VALUES (%s, 'owner', %s, %s, %s, TRUE)
             """,
-            (salon_id, owner_name, owner_email, generate_password_hash(DEFAULT_OWNER_PASSWORD)),
+            (salon_id, owner_name, owner_email, generate_password_hash(owner_password)),
         )
 
         old = sqlite3.connect(sqlite_path)
@@ -122,7 +135,6 @@ def main():
             )
         print(f"Imported SQLite data into salon {salon_name} with slug /s/{slug}/zakazi")
         print(f"Owner email: {owner_email}")
-        print(f"Temporary owner password: {DEFAULT_OWNER_PASSWORD}")
 
 
 if __name__ == "__main__":

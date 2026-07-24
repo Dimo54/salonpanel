@@ -1,5 +1,7 @@
 import hashlib
 import hmac
+import csv
+import io
 import os
 import re
 import unittest
@@ -58,6 +60,21 @@ class SecurityTests(unittest.TestCase):
             session["csrf_token"] = "test-csrf-token"
         return "test-csrf-token"
 
+    def booking_context(self, salon, form_data=None):
+        return {
+            "services": [],
+            "booking_data": {},
+            "settings": {
+                **salon_app.DEFAULT_SALON_SETTINGS,
+                "business_name": salon["name"],
+                "booking_min_notice_minutes": 120,
+                "booking_max_days": 90,
+                "cancellation_notice_hours": 24,
+            },
+            "salon": salon,
+            "form_data": form_data or {},
+        }
+
     def render_base_for_user(self, user, salon):
         settings = {
             **salon_app.DEFAULT_SALON_SETTINGS,
@@ -106,6 +123,36 @@ class SecurityTests(unittest.TestCase):
         ):
             with self.subTest(unsafe=unsafe):
                 self.assertIsNone(salon_app.safe_local_redirect(unsafe))
+
+    def test_external_referrer_is_not_used_for_status_redirect(self):
+        user = {"id": 5, "salon_id": 8, "role": "owner", "active": True}
+        salon = {"id": 8, "subscription_status": "active"}
+        with (
+            patch.object(salon_app, "validated_session_user", return_value=user),
+            patch.object(salon_app, "current_salon", return_value=salon),
+            patch.object(salon_app, "subscription_is_allowed", return_value=True),
+            patch.object(salon_app, "db_query", return_value={"id": salon["id"]}),
+        ):
+            response = self.client.post(
+                "/appointments/12/status",
+                data={"status": "invalid", "csrf_token": self.csrf_token()},
+                headers={"Referer": "https://attacker.example/redirect"},
+            )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/appointments")
+
+    def test_csrf_error_link_does_not_use_external_referrer(self):
+        with self.client.session_transaction() as session:
+            session["csrf_token"] = "expected-token"
+        response = self.client.post(
+            "/login",
+            data={"csrf_token": "invalid-token"},
+            headers={"Referer": "https://attacker.example/redirect"},
+        )
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn("attacker.example", html)
+        self.assertIn('href="/"', html)
 
     def test_login_rejects_scheme_relative_next_redirect(self):
         user = {
@@ -464,6 +511,266 @@ class SecurityTests(unittest.TestCase):
             response.headers["Retry-After"],
             str(salon_app.BOOKING_WINDOW_MINUTES * 60),
         )
+
+    def test_public_booking_form_responses_are_no_store(self):
+        salon = {
+            "id": 12,
+            "name": "Test salon",
+            "slug": "test-salon",
+            "subscription_status": "active",
+        }
+        with (
+            patch.object(salon_app, "db_query", return_value=salon),
+            patch.object(
+                salon_app,
+                "public_booking_context",
+                return_value=self.booking_context(salon),
+            ),
+        ):
+            response = self.client.get("/s/test-salon/zakazi")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_public_booking_validation_failure_is_no_store(self):
+        salon = {
+            "id": 12,
+            "name": "Test salon",
+            "slug": "test-salon",
+            "subscription_status": "active",
+        }
+        with (
+            patch.object(salon_app, "db_query", return_value=salon),
+            patch.object(salon_app, "rate_limit_exceeded", return_value=False),
+            patch.object(
+                salon_app,
+                "public_booking_context",
+                return_value=self.booking_context(salon),
+            ),
+        ):
+            response = self.client.post(
+                "/s/test-salon/zakazi",
+                data={
+                    "client_name": "Lični Podatak",
+                    "csrf_token": self.csrf_token(),
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+    def test_public_booking_conflict_is_private_and_no_store(self):
+        salon = {
+            "id": 12,
+            "name": "Test salon",
+            "slug": "test-salon",
+            "subscription_status": "active",
+            "booking_mode": "automatic",
+        }
+        generic_error = "Termin više nije dostupan. Izaberite drugo vreme."
+        existing_name = "Postojeći Klijent"
+
+        def persist_conflicting_appointment(
+            selected_salon,
+            service_id,
+            worker_id,
+            appointment_date,
+            appointment_time,
+            duration_minutes,
+            price,
+            status,
+            source,
+            notes,
+            **kwargs,
+        ):
+            error = salon_app.appointment_availability_error(
+                selected_salon,
+                worker_id,
+                appointment_date,
+                appointment_time,
+                duration_minutes,
+                public_request=kwargs.get("public_request", False),
+                worker={"id": worker_id, "active": True},
+            )
+            return None, error
+
+        with (
+            patch.object(salon_app, "db_query", return_value=salon),
+            patch.object(salon_app, "rate_limit_exceeded", return_value=False),
+            patch.object(
+                salon_app,
+                "worker_service_assignment",
+                return_value={"worker_duration_minutes": 30, "worker_price": 1000},
+            ),
+            patch.object(
+                salon_app,
+                "persist_appointment_locked",
+                side_effect=persist_conflicting_appointment,
+            ),
+            patch.object(
+                salon_app,
+                "effective_worker_hours",
+                return_value={"open": 9 * 60, "close": 17 * 60, "breaks": []},
+            ),
+            patch.object(salon_app, "worker_time_off_conflict", return_value=None),
+            patch.object(
+                salon_app,
+                "appointment_conflict",
+                return_value={"id": 99, "client_name": existing_name},
+            ),
+            patch.object(
+                salon_app,
+                "local_now",
+                return_value=salon_app.datetime(
+                    2030,
+                    1,
+                    9,
+                    8,
+                    0,
+                    tzinfo=salon_app.ZoneInfo("Europe/Belgrade"),
+                ),
+            ),
+            patch.object(
+                salon_app,
+                "public_booking_context",
+                side_effect=lambda selected_salon, form_data=None: self.booking_context(
+                    selected_salon,
+                    form_data,
+                ),
+            ),
+        ):
+            response = self.client.post(
+                "/s/test-salon/zakazi",
+                data={
+                    "client_name": "Novi Klijent",
+                    "client_phone": "0611234567",
+                    "client_email": "new@example.com",
+                    "service_id": "3",
+                    "worker_id": "4",
+                    "date": "2030-01-10",
+                    "time": "10:00",
+                    "privacy_accepted": "on",
+                    "csrf_token": self.csrf_token(),
+                },
+            )
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertIn(generic_error, html)
+        self.assertNotIn(existing_name, html)
+
+    def test_reminder_endpoint_requires_post_and_bearer_authorization(self):
+        secret = "cron-test-secret"
+        with patch.dict(salon_app.os.environ, {"CRON_SECRET": secret}):
+            self.assertEqual(
+                self.client.get(f"/tasks/send-reminders?secret={secret}").status_code,
+                405,
+            )
+            self.assertEqual(
+                self.client.post(f"/tasks/send-reminders?secret={secret}").status_code,
+                403,
+            )
+            self.assertEqual(self.client.post("/tasks/send-reminders").status_code, 403)
+            self.assertEqual(
+                self.client.post(
+                    "/tasks/send-reminders",
+                    headers={"Authorization": "Bearer incorrect"},
+                ).status_code,
+                403,
+            )
+
+    def test_valid_reminder_authorization_reaches_existing_logic_without_email(self):
+        secret = "cron-test-secret"
+        with (
+            patch.dict(salon_app.os.environ, {"CRON_SECRET": secret}),
+            patch.object(salon_app, "db_query", return_value=[]) as db_query,
+            patch.object(salon_app, "send_appointment_event") as send_event,
+        ):
+            response = self.client.post(
+                "/tasks/send-reminders",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"ok": True, "sent": 0, "failed": 0, "checked": 0})
+        db_query.assert_called_once()
+        send_event.assert_not_called()
+
+    def test_csv_safe_value_neutralizes_formula_prefixes(self):
+        for prefix in ("=", "+", "-", "@"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    salon_app.csv_safe_value(f"  {prefix}formula"),
+                    f"'  {prefix}formula",
+                )
+        self.assertEqual(salon_app.csv_safe_value("Željko Petrović"), "Željko Petrović")
+        self.assertEqual(salon_app.csv_safe_value(None), "")
+
+    def test_appointment_export_applies_csv_protection_to_editable_fields(self):
+        user = {"id": 5, "salon_id": 8, "role": "owner", "active": True}
+        salon = {"id": 8, "subscription_status": "active"}
+        row = {
+            "id": 1,
+            "date": "2030-01-10",
+            "time": "10:00",
+            "duration_minutes": 30,
+            "client": "=client",
+            "phone": "+38160000000",
+            "email": "=client@example.com",
+            "service": "-service",
+            "worker": "@worker",
+            "price": 1000,
+            "status": "scheduled",
+            "source": "admin",
+            "notes": "  =note",
+        }
+        with (
+            patch.object(salon_app, "validated_session_user", return_value=user),
+            patch.object(salon_app, "current_salon", return_value=salon),
+            patch.object(salon_app, "subscription_is_allowed", return_value=True),
+            patch.object(
+                salon_app,
+                "db_query",
+                side_effect=[{"id": salon["id"]}, [row]],
+            ),
+        ):
+            response = self.client.get("/export/appointments.csv")
+        exported = list(csv.reader(io.StringIO(response.get_data(as_text=True))))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(exported[1][4], "'=client")
+        self.assertEqual(exported[1][5], "'+38160000000")
+        self.assertEqual(exported[1][6], "'=client@example.com")
+        self.assertEqual(exported[1][7], "'-service")
+        self.assertEqual(exported[1][8], "'@worker")
+        self.assertEqual(exported[1][12], "'  =note")
+
+    def test_client_export_applies_csv_protection_to_contact_fields(self):
+        user = {"id": 5, "salon_id": 8, "role": "owner", "active": True}
+        salon = {"id": 8, "subscription_status": "active"}
+        row = {
+            "id": 1,
+            "name": "=client",
+            "phone": "+38160000000",
+            "email": "-mail@example.com",
+            "notes": "@note",
+            "created_at": "2030-01-10 10:00:00",
+            "visits": 2,
+            "revenue": 2000,
+        }
+        with (
+            patch.object(salon_app, "validated_session_user", return_value=user),
+            patch.object(salon_app, "current_salon", return_value=salon),
+            patch.object(salon_app, "subscription_is_allowed", return_value=True),
+            patch.object(
+                salon_app,
+                "db_query",
+                side_effect=[{"id": salon["id"]}, [row]],
+            ),
+        ):
+            response = self.client.get("/export/clients.csv")
+        exported = list(csv.reader(io.StringIO(response.get_data(as_text=True))))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(exported[1][1], "'=client")
+        self.assertEqual(exported[1][2], "'+38160000000")
+        self.assertEqual(exported[1][3], "'-mail@example.com")
+        self.assertEqual(exported[1][4], "'@note")
 
     def test_rate_limit_count_and_insert_is_serialized_and_hides_identifier(self):
         connection = FakeConnection(total=0)

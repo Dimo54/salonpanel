@@ -135,6 +135,68 @@ class SchedulingTests(unittest.TestCase):
         self.assertIn("ne radi", error)
         appointment_conflict.assert_not_called()
 
+    def test_public_conflict_does_not_reveal_existing_client_name(self):
+        existing_name = "Privatno Ime"
+        with (
+            patch.object(
+                salon_app,
+                "effective_worker_hours",
+                return_value={"open": 9 * 60, "close": 17 * 60, "breaks": []},
+            ),
+            patch.object(salon_app, "worker_time_off_conflict", return_value=None),
+            patch.object(
+                salon_app,
+                "appointment_conflict",
+                return_value={"id": 44, "client_name": existing_name},
+            ),
+            patch.object(
+                salon_app,
+                "local_now",
+                return_value=salon_app.datetime.combine(
+                    self.future_date - timedelta(days=1),
+                    salon_app.time(8, 0),
+                    tzinfo=salon_app.ZoneInfo("Europe/Belgrade"),
+                ),
+            ),
+        ):
+            error = salon_app.appointment_availability_error(
+                self.salon,
+                worker_id=2,
+                appointment_date=self.future_date,
+                appointment_time="10:00",
+                duration_minutes=30,
+                public_request=True,
+                worker={"id": 2, "active": True},
+            )
+        self.assertEqual(error, "Termin više nije dostupan. Izaberite drugo vreme.")
+        self.assertNotIn(existing_name, error)
+
+    def test_authenticated_conflict_keeps_detailed_client_information(self):
+        existing_name = "Poznati Klijent"
+        with (
+            patch.object(
+                salon_app,
+                "effective_worker_hours",
+                return_value={"open": 9 * 60, "close": 17 * 60, "breaks": []},
+            ),
+            patch.object(salon_app, "worker_time_off_conflict", return_value=None),
+            patch.object(
+                salon_app,
+                "appointment_conflict",
+                return_value={"id": 45, "client_name": existing_name},
+            ),
+        ):
+            error = salon_app.appointment_availability_error(
+                self.salon,
+                worker_id=2,
+                appointment_date=self.future_date,
+                appointment_time="10:00",
+                duration_minutes=30,
+                public_request=False,
+                worker={"id": 2, "active": True},
+            )
+        self.assertIn(existing_name, error)
+
     def test_appointment_conflict_counts_pending_and_scheduled_and_locks_rows(self):
         existing = {
             "id": 44,
@@ -193,7 +255,6 @@ class SchedulingTests(unittest.TestCase):
         ):
             appointment_id, error = salon_app.persist_appointment_locked(
                 self.salon,
-                client_id=10,
                 service_id=3,
                 worker_id=2,
                 appointment_date=self.future_date,
@@ -203,8 +264,9 @@ class SchedulingTests(unittest.TestCase):
                 status="scheduled",
                 source="public",
                 notes="",
+                client_id=10,
+                appointment_id=8,
                 public_request=True,
-                public_token="public-token",
             )
         self.assertEqual(appointment_id, 99)
         self.assertIsNone(error)
@@ -228,7 +290,6 @@ class SchedulingTests(unittest.TestCase):
         ):
             appointment_id, error = salon_app.persist_appointment_locked(
                 self.salon,
-                client_id=10,
                 service_id=3,
                 worker_id=2,
                 appointment_date=self.future_date,
@@ -238,6 +299,8 @@ class SchedulingTests(unittest.TestCase):
                 status="scheduled",
                 source="public",
                 notes="",
+                client_id=10,
+                appointment_id=8,
             )
         self.assertIsNone(appointment_id)
         self.assertIn("aktivan termin", error)
