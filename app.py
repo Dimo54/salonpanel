@@ -753,6 +753,20 @@ def safe_local_redirect(target):
     return target
 
 
+def safe_referrer_redirect(endpoint):
+    return safe_local_redirect(request.referrer) or url_for(endpoint)
+
+
+def csv_safe_value(value):
+    if value is None:
+        return ""
+    text = str(value)
+    meaningful = text.lstrip()
+    if meaningful.startswith(("=", "+", "-", "@")):
+        return "'" + text
+    return text
+
+
 def rate_limit_identifier_hash(scope, identifier):
     domain = b"salonpanel:rate-limit-identifier:v1\x00"
     message = domain + str(scope or "").encode("utf-8") + b"\x00" + str(identifier or "").encode("utf-8")
@@ -873,7 +887,10 @@ def protect_csrf():
         expected = session.get("csrf_token")
         supplied = request.form.get("csrf_token") or request.headers.get("X-CSRF-Token")
         if not expected or not supplied or not secrets.compare_digest(str(expected), str(supplied)):
-            return render_template("csrf_error.html"), 400
+            return render_template(
+                "csrf_error.html",
+                return_url=safe_referrer_redirect("home"),
+            ), 400
 
 
 @app.after_request
@@ -900,7 +917,7 @@ def add_security_headers(response):
     if request.is_secure:
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if session.get("user_id") or request.endpoint in {
-        "booking_success", "login", "register", "forgot_password", "reset_password"
+        "public_booking", "booking_success", "login", "register", "forgot_password", "reset_password"
     }:
         response.headers.setdefault("Cache-Control", "no-store")
     return response
@@ -1465,6 +1482,8 @@ def appointment_availability_error(
         cursor=cursor,
     )
     if conflict:
+        if public_request:
+            return "Termin više nije dostupan. Izaberite drugo vreme."
         return f"Radnik vec ima aktivan termin za klijenta {conflict['client_name']} u tom periodu."
     return None
 
@@ -2000,7 +2019,7 @@ def resend_verification():
     else:
         sent, error = send_verification_for_user(user)
         flash("Novi verifikacioni email je poslat." if sent else f"Email nije poslat: {error}", "success" if sent else "error")
-    return redirect(request.referrer or url_for("dashboard"))
+    return redirect(safe_referrer_redirect("dashboard"))
 
 
 @app.route("/forgot-password", methods=["GET", "POST"])
@@ -2464,7 +2483,7 @@ def appointment_status(appointment_id):
     new_status = request.form.get("status", "").strip()
     if new_status not in STATUS_LABELS:
         flash("Nepoznat status.", "error")
-        return redirect(request.referrer or url_for("appointments"))
+        return redirect(safe_referrer_redirect("appointments"))
     appointment = db_query(
         "SELECT * FROM appointments WHERE id = %s AND salon_id = %s",
         (appointment_id, salon_id),
@@ -2472,7 +2491,7 @@ def appointment_status(appointment_id):
     )
     if not appointment:
         flash("Termin nije pronadjen.", "error")
-        return redirect(request.referrer or url_for("appointments"))
+        return redirect(safe_referrer_redirect("appointments"))
 
     previous_status = appointment["status"]
     if new_status in ("pending", "scheduled"):
@@ -2492,7 +2511,7 @@ def appointment_status(appointment_id):
         )
         if error:
             flash(error, "error")
-            return redirect(request.referrer or url_for("appointments"))
+            return redirect(safe_referrer_redirect("appointments"))
     else:
         db_execute(
             "UPDATE appointments SET status = %s, updated_at = %s WHERE id = %s AND salon_id = %s",
@@ -2512,7 +2531,7 @@ def appointment_status(appointment_id):
             flash(f"Termin je otkazan, ali email nije poslat: {email_error}", "warning")
     else:
         flash("Status termina je promenjen.", "success")
-    return redirect(request.referrer or url_for("appointments"))
+    return redirect(safe_referrer_redirect("appointments"))
 
 
 @app.route("/appointments/<int:appointment_id>/delete", methods=["POST"])
@@ -3680,10 +3699,11 @@ def booking_success(slug, token):
     return render_template("booking_success.html", appointment=appointment, salon=salon)
 
 
-@app.route("/tasks/send-reminders", methods=["GET", "POST"])
+@app.route("/tasks/send-reminders", methods=["POST"])
 def send_reminders_task():
     cron_secret = os.environ.get("CRON_SECRET", "").strip()
-    supplied = request.headers.get("X-Cron-Secret", "") or request.args.get("secret", "")
+    authorization = request.headers.get("Authorization", "")
+    supplied = authorization[len("Bearer "):] if authorization.startswith("Bearer ") else ""
     if not cron_secret or not supplied or not secrets.compare_digest(cron_secret, supplied):
         return jsonify({"ok": False, "error": "Nedozvoljen pristup."}), 403
 
@@ -3764,7 +3784,7 @@ def export_appointments():
     writer = csv.writer(output)
     writer.writerow(["id", "date", "time", "duration_minutes", "client", "phone", "service", "worker", "price", "status", "source", "notes"])
     for row in rows:
-        writer.writerow([row[key] for key in row.keys()])
+        writer.writerow([csv_safe_value(row[key]) for key in row.keys()])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=appointments.csv"})
 
 
@@ -3790,7 +3810,7 @@ def export_clients():
     writer = csv.writer(output)
     writer.writerow(["id", "name", "phone", "email", "notes", "created_at", "visits", "revenue"])
     for row in rows:
-        writer.writerow([row[key] for key in row.keys()])
+        writer.writerow([csv_safe_value(row[key]) for key in row.keys()])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=clients.csv"})
 
 

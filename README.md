@@ -160,7 +160,7 @@ Aplikacija će raditi i bez ovih promenljivih, ali emailovi neće biti poslati.
 CRON_SECRET=druga_duga_nasumicna_vrednost
 ```
 
-`CRON_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu treba da pošalje tajnu u zaglavlju `X-Cron-Secret` ili kao `secret` parametar.
+`CRON_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu mora da koristi `POST` i pošalje tajnu samo kroz zaglavlje `Authorization: Bearer ...`.
 
 ### Opciona zaštita prijave
 
