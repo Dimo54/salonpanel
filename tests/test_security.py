@@ -639,6 +639,7 @@ class SecurityTests(unittest.TestCase):
             "duration_minutes": 30,
             "client": "=client",
             "phone": "+38160000000",
+            "email": "=client@example.com",
             "service": "-service",
             "worker": "@worker",
             "price": 1000,
@@ -661,9 +662,10 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(exported[1][4], "'=client")
         self.assertEqual(exported[1][5], "'+38160000000")
-        self.assertEqual(exported[1][6], "'-service")
-        self.assertEqual(exported[1][7], "'@worker")
-        self.assertEqual(exported[1][11], "'  =note")
+        self.assertEqual(exported[1][6], "'=client@example.com")
+        self.assertEqual(exported[1][7], "'-service")
+        self.assertEqual(exported[1][8], "'@worker")
+        self.assertEqual(exported[1][12], "'  =note")
 
     def test_client_export_applies_csv_protection_to_contact_fields(self):
         user = {"id": 5, "salon_id": 8, "role": "owner", "active": True}

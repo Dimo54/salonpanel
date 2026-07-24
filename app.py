@@ -99,6 +99,12 @@ STATUS_CLASSES = {
     "no_show": "status-no-show",
 }
 
+CONTACT_SOURCES = (
+    "public_submission",
+    "admin_submission",
+    "legacy_backfill",
+)
+
 SUBSCRIPTION_LABELS = {
     "trial": "Probni period",
     "active": "Aktivna",
@@ -246,6 +252,7 @@ def init_db():
         salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
         phone TEXT,
+        phone_normalized TEXT,
         email TEXT,
         notes TEXT,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -305,6 +312,13 @@ def init_db():
         id SERIAL PRIMARY KEY,
         salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
         client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+        contact_name TEXT,
+        contact_phone TEXT,
+        contact_phone_normalized TEXT,
+        contact_email TEXT,
+        contact_source TEXT,
+        privacy_consent_at TIMESTAMP,
+        marketing_consent BOOLEAN,
         service_id INTEGER NOT NULL REFERENCES services(id) ON DELETE RESTRICT,
         worker_id INTEGER REFERENCES workers(id) ON DELETE RESTRICT,
         date DATE NOT NULL,
@@ -397,6 +411,7 @@ def init_db():
     ALTER TABLE workers ADD COLUMN IF NOT EXISTS is_default BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP;
+    ALTER TABLE clients ADD COLUMN IF NOT EXISTS phone_normalized TEXT;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS privacy_consent_at TIMESTAMP;
     ALTER TABLE clients ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE salons ADD COLUMN IF NOT EXISTS booking_min_notice_minutes INTEGER NOT NULL DEFAULT 120;
@@ -405,6 +420,13 @@ def init_db():
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS worker_id INTEGER REFERENCES workers(id) ON DELETE RESTRICT;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS duration_minutes INTEGER NOT NULL DEFAULT 30;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS public_token TEXT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS contact_name TEXT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS contact_phone TEXT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS contact_phone_normalized TEXT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS contact_email TEXT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS contact_source TEXT;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS privacy_consent_at TIMESTAMP;
+    ALTER TABLE appointments ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN;
 
     UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
     UPDATE appointments a
@@ -414,6 +436,7 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_users_salon_id ON users(salon_id);
     CREATE INDEX IF NOT EXISTS idx_clients_salon_id ON clients(salon_id);
+    CREATE INDEX IF NOT EXISTS idx_clients_salon_phone_normalized ON clients(salon_id, phone_normalized);
     CREATE INDEX IF NOT EXISTS idx_services_salon_id ON services(salon_id);
     CREATE INDEX IF NOT EXISTS idx_workers_salon_id ON workers(salon_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_one_default ON workers(salon_id) WHERE is_default = TRUE;
@@ -424,6 +447,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_rate_limit_attempts_lookup ON rate_limit_attempts(scope, key_hash, created_at);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_attempts_created_at ON rate_limit_attempts(created_at);
     CREATE INDEX IF NOT EXISTS idx_email_events_appointment ON email_events(appointment_id, event_key);
+    CREATE INDEX IF NOT EXISTS idx_appointments_client_id ON appointments(client_id);
     CREATE INDEX IF NOT EXISTS idx_appointments_salon_date ON appointments(salon_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_worker_date ON appointments(worker_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
@@ -1349,7 +1373,8 @@ def appointment_conflict(
     end_minutes = start_minutes + int(duration_minutes or 0)
     params = [salon_id, worker_id, appointment_date]
     sql = """
-        SELECT a.id, a.time, a.duration_minutes, c.name AS client_name
+        SELECT a.id, a.time, a.duration_minutes,
+               COALESCE(a.contact_name, c.name) AS client_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         WHERE a.salon_id = %s
@@ -2133,7 +2158,10 @@ def dashboard():
 
     upcoming = db_query(
         """
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+        SELECT a.*,
+               COALESCE(a.contact_name, c.name) AS client_name,
+               COALESCE(a.contact_phone, c.phone) AS client_phone,
+               s.name AS service_name,
                w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
@@ -2222,7 +2250,8 @@ def appointments():
         params.append(worker_filter)
     if search:
         where.append(
-            "(LOWER(c.name) LIKE LOWER(%s) OR c.phone LIKE %s OR LOWER(s.name) LIKE LOWER(%s) "
+            "(LOWER(COALESCE(a.contact_name, c.name)) LIKE LOWER(%s) "
+            "OR COALESCE(a.contact_phone, c.phone) LIKE %s OR LOWER(s.name) LIKE LOWER(%s) "
             "OR LOWER(COALESCE(w.name, '')) LIKE LOWER(%s))"
         )
         pattern = f"%{search}%"
@@ -2230,7 +2259,10 @@ def appointments():
 
     rows = db_query(
         f"""
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+        SELECT a.*,
+               COALESCE(a.contact_name, c.name) AS client_name,
+               COALESCE(a.contact_phone, c.phone) AS client_phone,
+               s.name AS service_name,
                w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
@@ -2313,7 +2345,10 @@ def appointment_edit(appointment_id):
     salon_id = current_salon()["id"]
     appointment = db_query(
         """
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, c.email AS client_email,
+        SELECT a.*,
+               COALESCE(a.contact_name, c.name) AS client_name,
+               COALESCE(a.contact_phone, c.phone) AS client_phone,
+               COALESCE(a.contact_email, c.email) AS client_email,
                s.name AS service_name, w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
@@ -2426,7 +2461,9 @@ def appointment_email_data(appointment_id, salon_id):
     row = db_query(
         """
         SELECT a.id, a.date, a.time, a.status, a.updated_at,
-               c.name AS client_name, c.email AS client_email,
+               COALESCE(a.contact_name, c.name) AS client_name,
+               COALESCE(a.contact_phone, c.phone) AS client_phone,
+               COALESCE(a.contact_email, c.email) AS client_email,
                s.name AS service_name, w.name AS worker_name, sal.name AS salon_name,
                sal.address AS salon_address, sal.phone AS salon_phone,
                sal.owner_name, sal.owner_email
@@ -2914,7 +2951,10 @@ def appointment_calendar():
         week_end = week_start + timedelta(days=6)
         rows = db_query(
             """
-            SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+            SELECT a.*,
+                   COALESCE(a.contact_name, c.name) AS client_name,
+                   COALESCE(a.contact_phone, c.phone) AS client_phone,
+                   s.name AS service_name,
                    w.name AS worker_name
             FROM appointments a
             JOIN clients c ON c.id = a.client_id
@@ -2953,7 +2993,10 @@ def appointment_calendar():
 
     appointments_rows = db_query(
         """
-        SELECT a.*, c.name AS client_name, c.phone AS client_phone, s.name AS service_name,
+        SELECT a.*,
+               COALESCE(a.contact_name, c.name) AS client_name,
+               COALESCE(a.contact_phone, c.phone) AS client_phone,
+               s.name AS service_name,
                w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
@@ -3684,7 +3727,8 @@ def booking_success(slug, token):
         return redirect(url_for("legacy_booking"))
     appointment = db_query(
         """
-        SELECT a.*, c.name AS client_name, s.name AS service_name, w.name AS worker_name
+        SELECT a.*, COALESCE(a.contact_name, c.name) AS client_name,
+               s.name AS service_name, w.name AS worker_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
@@ -3769,7 +3813,10 @@ def export_appointments():
     salon_id = current_salon()["id"]
     rows = db_query(
         """
-        SELECT a.id, a.date, a.time, a.duration_minutes, c.name AS client, c.phone,
+        SELECT a.id, a.date, a.time, a.duration_minutes,
+               COALESCE(a.contact_name, c.name) AS client,
+               COALESCE(a.contact_phone, c.phone) AS phone,
+               COALESCE(a.contact_email, c.email) AS email,
                s.name AS service, w.name AS worker, a.price, a.status, a.source, a.notes
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
@@ -3782,7 +3829,7 @@ def export_appointments():
     )
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "date", "time", "duration_minutes", "client", "phone", "service", "worker", "price", "status", "source", "notes"])
+    writer.writerow(["id", "date", "time", "duration_minutes", "client", "phone", "email", "service", "worker", "price", "status", "source", "notes"])
     for row in rows:
         writer.writerow([csv_safe_value(row[key]) for key in row.keys()])
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=appointments.csv"})
@@ -3895,7 +3942,8 @@ def super_admin_salon_detail(salon_id):
     users = db_query("SELECT id, name, email, role, active, created_at FROM users WHERE salon_id = %s ORDER BY created_at DESC", (salon_id,))
     recent = db_query(
         """
-        SELECT a.*, c.name AS client_name, s.name AS service_name
+        SELECT a.*, COALESCE(a.contact_name, c.name) AS client_name,
+               s.name AS service_name
         FROM appointments a
         JOIN clients c ON c.id = a.client_id
         JOIN services s ON s.id = a.service_id
