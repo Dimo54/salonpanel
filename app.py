@@ -9,7 +9,7 @@ import re
 import secrets
 import time as time_module
 import unicodedata
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from functools import wraps
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse
 from urllib.request import Request, urlopen
@@ -58,6 +58,20 @@ PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "").strip()
 PADDLE_WEBHOOK_TOLERANCE_SECONDS = max(
     0,
     int(os.environ.get("PADDLE_WEBHOOK_TOLERANCE_SECONDS", "5")),
+)
+
+
+def parse_subscription_grace_days(value, default=7):
+    """Parse a bounded grace period without exposing configuration input."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if 0 <= parsed <= 365 else default
+
+
+SUBSCRIPTION_GRACE_DAYS = parse_subscription_grace_days(
+    os.environ.get("SUBSCRIPTION_GRACE_DAYS"),
 )
 PADDLE_API_TIMEOUT_SECONDS = 10
 PADDLE_SUBSCRIPTION_EVENT_TYPES = frozenset(
@@ -292,6 +306,7 @@ def init_db():
         paddle_customer_id TEXT,
         paddle_subscription_id TEXT,
         paddle_subscription_updated_at TIMESTAMPTZ,
+        subscription_grace_ends_at TIMESTAMPTZ,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -490,6 +505,7 @@ def init_db():
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN;
     ALTER TABLE subscription_events ADD COLUMN IF NOT EXISTS paddle_event_id TEXT;
     ALTER TABLE salons ADD COLUMN IF NOT EXISTS paddle_subscription_updated_at TIMESTAMPTZ;
+    ALTER TABLE salons ADD COLUMN IF NOT EXISTS subscription_grace_ends_at TIMESTAMPTZ;
 
     UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
     UPDATE appointments a
@@ -1031,10 +1047,14 @@ def add_security_headers(response):
 
 
 def current_user():
+    if hasattr(g, "current_user"):
+        return g.current_user
     user_id = session.get("user_id")
     if not user_id:
+        g.current_user = None
         return None
-    return db_query("SELECT * FROM users WHERE id = %s AND active = TRUE", (user_id,), one=True)
+    g.current_user = db_query("SELECT * FROM users WHERE id = %s AND active = TRUE", (user_id,), one=True)
+    return g.current_user
 
 
 def validated_session_user():
@@ -1045,17 +1065,23 @@ def validated_session_user():
 
 
 def current_salon():
+    if hasattr(g, "current_salon"):
+        return g.current_salon
     user = current_user()
     if not user:
+        g.current_salon = None
         return None
     if user["role"] == "super_admin" and session.get("impersonate_salon_id"):
         salon = db_query("SELECT * FROM salons WHERE id = %s", (session["impersonate_salon_id"],), one=True)
         if not salon:
             session.pop("impersonate_salon_id", None)
+        g.current_salon = salon
         return salon
     if not user.get("salon_id"):
+        g.current_salon = None
         return None
-    return db_query("SELECT * FROM salons WHERE id = %s", (user["salon_id"],), one=True)
+    g.current_salon = db_query("SELECT * FROM salons WHERE id = %s", (user["salon_id"],), one=True)
+    return g.current_salon
 
 
 def salon_settings(salon):
@@ -1084,29 +1110,66 @@ def salon_settings(salon):
     }
 
 
-def subscription_is_allowed(salon) -> bool:
+def _coerce_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_aware_datetime(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def salon_has_subscription_access(salon, now=None) -> bool:
     if not salon:
         return False
-    status = salon["subscription_status"]
-    if status in ("active", "free"):
+    status = salon.get("subscription_status")
+    if status == "active":
         return True
     if status == "trial":
-        trial_ends_at = salon.get("trial_ends_at")
-        if isinstance(trial_ends_at, str):
-            try:
-                trial_ends_at = datetime.strptime(trial_ends_at, "%Y-%m-%d").date()
-            except ValueError:
-                return False
-        return bool(trial_ends_at and trial_ends_at >= local_today())
+        trial_end = _coerce_date(salon.get("trial_ends_at"))
+        today = now.date() if isinstance(now, datetime) else (now if isinstance(now, date) else local_today())
+        return bool(trial_end and trial_end >= today)
+    if status == "past_due":
+        grace_end = _coerce_aware_datetime(salon.get("subscription_grace_ends_at"))
+        if not grace_end:
+            return False
+        check_time = now or datetime.now(timezone.utc)
+        if not isinstance(check_time, datetime) or check_time.tzinfo is None:
+            return False
+        return check_time <= grace_end
     return False
+
+
+def subscription_is_allowed(salon) -> bool:
+    return salon_has_subscription_access(salon)
 
 
 def subscription_days_left(salon):
     if not salon or salon["subscription_status"] != "trial" or not salon.get("trial_ends_at"):
         return None
     trial_ends_at = salon["trial_ends_at"]
-    if isinstance(trial_ends_at, str):
-        trial_ends_at = datetime.strptime(trial_ends_at, "%Y-%m-%d").date()
+    trial_ends_at = _coerce_date(trial_ends_at)
+    if not trial_ends_at:
+        return None
     return (trial_ends_at - local_today()).days
 
 
@@ -1225,32 +1288,62 @@ def salon_required(view):
             impersonate_salon_id = session.get("impersonate_salon_id")
             if not impersonate_salon_id:
                 return redirect(url_for("super_admin_dashboard"))
-            salon = db_query("SELECT * FROM salons WHERE id = %s", (impersonate_salon_id,), one=True)
+            salon = current_salon()
             if not salon:
                 session.pop("impersonate_salon_id", None)
                 flash("Salon koji ste gledali vise ne postoji.", "warning")
                 return redirect(url_for("super_admin_dashboard"))
-        elif not user.get("salon_id") or not db_query(
-            "SELECT id FROM salons WHERE id = %s",
-            (user.get("salon_id"),),
-            one=True,
-        ):
-            session.clear()
-            flash("Salon nije pronadjen za ovaj nalog.", "error")
-            return redirect(url_for("login"))
+        else:
+            if hasattr(g, "current_salon"):
+                salon_exists = g.current_salon
+            else:
+                # Preserve decorator behavior when current_salon is replaced by a test/integration adapter.
+                salon_exists = db_query(
+                    "SELECT id FROM salons WHERE id = %s", (user.get("salon_id"),), one=True,
+                ) if user.get("salon_id") else None
+            if not salon_exists:
+                session.clear()
+                flash("Salon nije pronadjen za ovaj nalog.", "error")
+                return redirect(url_for("login"))
         return view(*args, **kwargs)
     return wrapped_view
 
 
-def subscription_required(view):
-    @wraps(view)
-    def wrapped_view(*args, **kwargs):
-        salon = current_salon()
-        if not subscription_is_allowed(salon):
-            flash("Pretplata nije aktivna. Aktivirajte nalog da biste nastavili.", "warning")
-            return redirect(url_for("subscription_page"))
-        return view(*args, **kwargs)
-    return wrapped_view
+SUBSCRIPTION_GATE_EXEMPT_ENDPOINTS = frozenset({
+    "home", "static", "login", "logout", "register", "verify_email",
+    "resend_verification", "forgot_password", "reset_password",
+    "privacy_policy", "terms_of_service", "robots_txt", "sitemap_xml",
+    "subscription_page", "paddle_customer_portal", "paddle_webhook",
+    "send_reminders_task", "legacy_booking", "public_available_dates",
+    "public_availability", "public_booking", "booking_success",
+    "super_admin_dashboard", "super_admin_salons", "super_admin_salon_detail",
+    "super_admin_update_subscription", "super_admin_delete_salon",
+    "super_admin_impersonate", "super_admin_stop_impersonating",
+    "health", "health_check", "readiness",
+})
+
+
+@app.before_request
+def enforce_subscription_access():
+    if request.method == "OPTIONS" or request.endpoint in SUBSCRIPTION_GATE_EXEMPT_ENDPOINTS:
+        return None
+    if not session.get("user_id"):
+        return None
+    user = validated_session_user()
+    if not user or user.get("role") == "super_admin":
+        return None
+    # Missing salons remain the responsibility of salon_required.
+    salon = current_salon()
+    if not salon or salon_has_subscription_access(salon):
+        return None
+    wants_json = request.is_json or request.accept_mimetypes.best == "application/json"
+    if wants_json:
+        response = jsonify({"ok": False, "error": "Pretplata ne dozvoljava pristup."})
+        response.status_code = 403
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    flash("Pretplata nije aktivna. Otvorite stranicu pretplate da biste nastavili.", "warning")
+    return redirect(url_for("subscription_page"))
 
 
 def super_admin_required(view):
@@ -2413,7 +2506,6 @@ def dashboard():
 
 @app.route("/appointments")
 @salon_required
-@subscription_required
 def appointments():
     salon_id = current_salon()["id"]
     status = request.args.get("status", "").strip()
@@ -2504,7 +2596,6 @@ def appointment_form_context(salon_id):
 
 @app.route("/appointments/new", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def appointment_new():
     salon_id = current_salon()["id"]
     appointment = {}
@@ -2526,7 +2617,6 @@ def appointment_new():
 
 @app.route("/appointments/<int:appointment_id>/edit", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def appointment_edit(appointment_id):
     salon_id = current_salon()["id"]
     appointment = db_query(
@@ -2710,7 +2800,6 @@ def send_appointment_event(appointment_id, salon_id, event_key, message_type, on
 
 @app.route("/appointments/<int:appointment_id>/status", methods=["POST"])
 @salon_required
-@subscription_required
 def appointment_status(appointment_id):
     salon = current_salon()
     salon_id = salon["id"]
@@ -2770,7 +2859,6 @@ def appointment_status(appointment_id):
 
 @app.route("/appointments/<int:appointment_id>/delete", methods=["POST"])
 @salon_required
-@subscription_required
 def appointment_delete(appointment_id):
     salon_id = current_salon()["id"]
     appointment = db_query(
@@ -2796,7 +2884,6 @@ def appointment_delete(appointment_id):
 
 @app.route("/clients")
 @salon_required
-@subscription_required
 def clients():
     salon_id = current_salon()["id"]
     search = request.args.get("q", "").strip()
@@ -2825,7 +2912,6 @@ def clients():
 
 @app.route("/workers")
 @salon_required
-@subscription_required
 def workers():
     salon_id = current_salon()["id"]
     rows = db_query(
@@ -2876,7 +2962,6 @@ def worker_schedule_context(worker_id=None, form_data=None):
 
 @app.route("/workers/new", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def worker_new():
     salon_id = current_salon()["id"]
     worker = {}
@@ -2899,7 +2984,6 @@ def worker_new():
 
 @app.route("/workers/<int:worker_id>/edit", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def worker_edit(worker_id):
     salon_id = current_salon()["id"]
     worker = db_query("SELECT * FROM workers WHERE id = %s AND salon_id = %s", (worker_id, salon_id), one=True)
@@ -3087,7 +3171,6 @@ def save_worker(worker_id=None):
 
 @app.route("/workers/<int:worker_id>/toggle", methods=["POST"])
 @salon_required
-@subscription_required
 def worker_toggle(worker_id):
     salon_id = current_salon()["id"]
     worker = db_query("SELECT * FROM workers WHERE id = %s AND salon_id = %s", (worker_id, salon_id), one=True)
@@ -3102,7 +3185,6 @@ def worker_toggle(worker_id):
 
 @app.route("/workers/<int:worker_id>/delete", methods=["POST"])
 @salon_required
-@subscription_required
 def worker_delete(worker_id):
     salon_id = current_salon()["id"]
     used = db_query(
@@ -3127,7 +3209,6 @@ def worker_delete(worker_id):
 
 @app.route("/calendar")
 @salon_required
-@subscription_required
 def appointment_calendar():
     salon = current_salon()
     salon_id = salon["id"]
@@ -3294,7 +3375,6 @@ def parse_calendar_month(value):
 
 @app.route("/availability", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def worker_availability_calendar():
     salon_id = current_salon()["id"]
     if request.method == "POST":
@@ -3423,7 +3503,6 @@ def worker_availability_calendar():
 
 @app.route("/availability/time-off/<int:time_off_id>/delete", methods=["POST"])
 @salon_required
-@subscription_required
 def worker_time_off_delete(time_off_id):
     salon_id = current_salon()["id"]
     row = db_query(
@@ -3441,7 +3520,6 @@ def worker_time_off_delete(time_off_id):
 
 @app.route("/services")
 @salon_required
-@subscription_required
 def services():
     salon_id = current_salon()["id"]
     rows = db_query(
@@ -3466,7 +3544,6 @@ def services():
 
 @app.route("/services/new", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def service_new():
     if request.method == "POST":
         result = save_service()
@@ -3478,7 +3555,6 @@ def service_new():
 
 @app.route("/services/<int:service_id>/edit", methods=["GET", "POST"])
 @salon_required
-@subscription_required
 def service_edit(service_id):
     salon_id = current_salon()["id"]
     service = db_query("SELECT * FROM services WHERE id = %s AND salon_id = %s", (service_id, salon_id), one=True)
@@ -3537,7 +3613,6 @@ def save_service(service_id=None):
 
 @app.route("/services/<int:service_id>/toggle", methods=["POST"])
 @salon_required
-@subscription_required
 def service_toggle(service_id):
     salon_id = current_salon()["id"]
     service = db_query("SELECT * FROM services WHERE id = %s AND salon_id = %s", (service_id, salon_id), one=True)
@@ -3549,7 +3624,6 @@ def service_toggle(service_id):
 
 @app.route("/services/<int:service_id>/delete", methods=["POST"])
 @salon_required
-@subscription_required
 def service_delete(service_id):
     salon_id = current_salon()["id"]
     used = db_query("SELECT COUNT(*) AS total FROM appointments WHERE service_id = %s AND salon_id = %s", (service_id, salon_id), one=True)["total"]
@@ -3672,6 +3746,7 @@ def settings_page():
 @app.route("/subscription")
 @salon_required
 def subscription_page():
+    salon = current_salon()
     paddle_environment = PADDLE_ENVIRONMENT if PADDLE_ENVIRONMENT in {"sandbox", "production"} else ""
     paddle_config = {
         "environment": paddle_environment,
@@ -3682,7 +3757,9 @@ def subscription_page():
     return render_template(
         "subscription.html",
         paddle_config=paddle_config,
-        paddle_checkout_available=all(paddle_config.values()),
+        paddle_checkout_available=all(paddle_config.values()) and salon.get("subscription_status") != "active",
+        portal_available=bool(salon.get("paddle_customer_id")),
+        subscription_access_allowed=salon_has_subscription_access(salon),
     )
 
 
@@ -3718,35 +3795,93 @@ class PaddleProcessingError(Exception):
         self.status_code = status_code
 
 
-def fetch_paddle_subscription(subscription_id):
+def paddle_api_base():
     if not PADDLE_API_KEY:
         raise PaddleProcessingError("Paddle API nije konfigurisan.", 503)
     if PADDLE_ENVIRONMENT == "sandbox":
-        api_base = "https://sandbox-api.paddle.com"
-    elif PADDLE_ENVIRONMENT == "production":
-        api_base = "https://api.paddle.com"
-    else:
-        raise PaddleProcessingError("Paddle okruzenje nije ispravno.", 503)
+        return "https://sandbox-api.paddle.com"
+    if PADDLE_ENVIRONMENT == "production":
+        return "https://api.paddle.com"
+    raise PaddleProcessingError("Paddle okruzenje nije ispravno.", 503)
+
+
+def paddle_api_json(path, method="GET"):
+    api_base = paddle_api_base()
+    headers = {
+        "Authorization": f"Bearer {PADDLE_API_KEY}",
+        "Accept": "application/json",
+        "Paddle-Version": "1",
+    }
+    data = None
+    if method == "POST":
+        headers["Content-Type"] = "application/json"
+        data = b""
 
     api_request = Request(
-        f"{api_base}/subscriptions/{subscription_id}",
-        headers={
-            "Authorization": f"Bearer {PADDLE_API_KEY}",
-            "Accept": "application/json",
-            "Paddle-Version": "1",
-        },
+        f"{api_base}{path}", headers=headers, data=data, method=method,
     )
     try:
         with urlopen(api_request, timeout=PADDLE_API_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read())
     except Exception:
         # Never include the exception: HTTP clients can echo headers or response bodies.
-        app.logger.warning("Paddle subscription retrieval failed.")
-        raise PaddleProcessingError("Paddle pretplata trenutno nije dostupna.", 502)
-    subscription = body.get("data") if isinstance(body, dict) else None
+        app.logger.warning("Paddle API request failed.")
+        raise PaddleProcessingError("Paddle servis trenutno nije dostupan.", 502)
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict):
+        raise PaddleProcessingError("Paddle odgovor nije ispravan.", 502)
+    return data
+
+
+def fetch_paddle_subscription(subscription_id):
+    subscription = paddle_api_json(f"/subscriptions/{subscription_id}")
     if not isinstance(subscription, dict):
         raise PaddleProcessingError("Paddle pretplata nije ispravna.", 502)
     return subscription
+
+
+def paddle_customer_portal_url(customer_id):
+    if not isinstance(customer_id, str) or not re.fullmatch(r"ctm_[a-z0-9]{26}", customer_id):
+        raise PaddleProcessingError("Paddle korisnik nije ispravan.", 400)
+    portal_session = paddle_api_json(
+        f"/customers/{customer_id}/portal-sessions", method="POST",
+    )
+    urls = portal_session.get("urls")
+    general = urls.get("general") if isinstance(urls, dict) else None
+    portal_url = general.get("overview") if isinstance(general, dict) else None
+    if not isinstance(portal_url, str):
+        raise PaddleProcessingError("Paddle portal nije dostupan.", 502)
+    try:
+        parsed = urlsplit(portal_url)
+        parsed_port = parsed.port
+    except ValueError:
+        raise PaddleProcessingError("Paddle portal nije dostupan.", 502)
+    expected_host = (
+        "sandbox-customer-portal.paddle.com"
+        if PADDLE_ENVIRONMENT == "sandbox"
+        else "customer-portal.paddle.com"
+    )
+    if parsed.scheme != "https" or parsed.hostname != expected_host or parsed.username or parsed.password or parsed_port:
+        raise PaddleProcessingError("Paddle portal nije dostupan.", 502)
+    return portal_url
+
+
+@app.route("/subscription/customer-portal", methods=["POST"])
+@salon_required
+def paddle_customer_portal():
+    salon = current_salon()
+    customer_id = salon.get("paddle_customer_id")
+    if not customer_id:
+        flash("Upravljanje naplatom jos nije dostupno za ovaj nalog.", "warning")
+        return redirect(url_for("subscription_page"))
+    try:
+        portal_url = paddle_customer_portal_url(customer_id)
+    except PaddleProcessingError:
+        flash("Paddle portal trenutno nije dostupan. Pokusajte ponovo kasnije.", "error")
+        return redirect(url_for("subscription_page"))
+    response = redirect(portal_url)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def positive_int(value):
@@ -3870,8 +4005,12 @@ def paddle_webhook():
 
             authoritative_id = subscription.get("id")
             customer_id = subscription.get("customer_id")
-            source_updated_at = paddle_timestamp(subscription.get("updated_at"))
+            source_updated_at = (
+                paddle_timestamp(subscription.get("updated_at"))
+                or paddle_timestamp(event.get("occurred_at"))
+            )
             plan = paddle_subscription_plan(subscription)
+            local_status = paddle_subscription_status(subscription.get("status"))
             if (
                 not isinstance(authoritative_id, str)
                 or authoritative_id != subscription_id
@@ -3883,11 +4022,19 @@ def paddle_webhook():
                 raise PaddleProcessingError("Paddle pretplata nije ispravna.", 502)
 
             cur.execute(
-                "SELECT id FROM salons WHERE id = %s FOR UPDATE",
+                "SELECT id, subscription_status, subscription_grace_ends_at FROM salons WHERE id = %s FOR UPDATE",
                 (salon_id,),
             )
-            if not cur.fetchone():
+            locked_salon = cur.fetchone()
+            if not locked_salon:
                 raise PaddleProcessingError("Salon nije pronadjen.", 404)
+
+            grace_ends_at = None
+            if local_status == "past_due":
+                if locked_salon.get("subscription_status") == "past_due" and locked_salon.get("subscription_grace_ends_at"):
+                    grace_ends_at = locked_salon["subscription_grace_ends_at"]
+                else:
+                    grace_ends_at = source_updated_at + timedelta(days=SUBSCRIPTION_GRACE_DAYS)
 
             cur.execute(
                 """
@@ -3897,19 +4044,20 @@ def paddle_webhook():
                     paddle_customer_id = %s,
                     paddle_subscription_id = %s,
                     paddle_subscription_updated_at = %s,
-                    updated_at = %s
+                    subscription_grace_ends_at = %s,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
                   AND (paddle_subscription_updated_at IS NULL
                        OR paddle_subscription_updated_at <= %s)
                 RETURNING id
                 """,
                 (
-                    paddle_subscription_status(subscription.get("status")),
+                    local_status,
                     plan,
                     customer_id.strip(),
                     authoritative_id,
                     source_updated_at,
-                    datetime.now(),
+                    grace_ends_at,
                     salon_id,
                     source_updated_at,
                 ),
@@ -4213,8 +4361,10 @@ def send_reminders_task():
         JOIN salons s ON s.id = a.salon_id
         WHERE a.status = 'scheduled'
           AND a.date BETWEEN %s AND %s
-          AND (s.subscription_status IN ('active', 'free')
-               OR (s.subscription_status = 'trial' AND s.trial_ends_at >= %s))
+          AND (s.subscription_status = 'active'
+               OR (s.subscription_status = 'trial' AND s.trial_ends_at >= %s)
+               OR (s.subscription_status = 'past_due'
+                   AND s.subscription_grace_ends_at >= CURRENT_TIMESTAMP))
         ORDER BY a.date, a.time
         """,
         (now.date(), now.date() + timedelta(days=2), now.date()),
@@ -4262,7 +4412,6 @@ def terms_of_service():
 
 @app.route("/export/appointments.csv")
 @salon_required
-@subscription_required
 def export_appointments():
     salon_id = current_salon()["id"]
     rows = db_query(
@@ -4291,7 +4440,6 @@ def export_appointments():
 
 @app.route("/export/clients.csv")
 @salon_required
-@subscription_required
 def export_clients():
     salon_id = current_salon()["id"]
     rows = db_query(
@@ -4428,7 +4576,8 @@ def super_admin_update_subscription(salon_id):
             cur.execute(
                 """
                 UPDATE salons
-                SET subscription_status = %s, subscription_plan = %s, trial_ends_at = %s, updated_at = %s
+                SET subscription_status = %s, subscription_plan = %s, trial_ends_at = %s,
+                    subscription_grace_ends_at = NULL, updated_at = %s
                 WHERE id = %s
                 """,
                 (status, plan, trial_ends_at, datetime.now(), salon_id),

@@ -3,7 +3,7 @@ import hmac
 import json
 import os
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -128,6 +128,44 @@ class PaddleIntegrationTests(unittest.TestCase):
         self.assertNotIn("https://cdn.paddle.com/paddle/v2/paddle.js", body)
         self.assertIn("Probni period", body)
 
+    def test_active_subscription_page_hides_ids_and_duplicate_checkout(self):
+        salon = {
+            **self.salon,
+            "subscription_status": "active",
+            "subscription_plan": "monthly",
+            "paddle_customer_id": "ctm_sensitive_customer",
+            "paddle_subscription_id": "sub_sensitive_subscription",
+        }
+        with (
+            patch.object(salon_app, "validated_session_user", return_value=self.user),
+            patch.object(salon_app, "current_user", return_value=self.user),
+            patch.object(salon_app, "current_salon", return_value=salon),
+            patch.object(salon_app, "db_query", return_value={"id": salon["id"]}),
+            patch.object(salon_app, "salon_settings", return_value=salon_app.DEFAULT_SALON_SETTINGS),
+            patch.object(salon_app, "PADDLE_API_KEY", "server_secret"),
+        ):
+            response = self.client.get("/subscription")
+        body = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Pretplata je aktivna", body)
+        self.assertIn("Otvori Paddle portal", body)
+        self.assertNotIn("Izaberi mesečni plan", body)
+        self.assertNotIn("ctm_sensitive_customer", body)
+        self.assertNotIn("sub_sensitive_subscription", body)
+        self.assertNotIn("server_secret", body)
+
+    def test_portal_button_only_appears_with_customer_id(self):
+        salon = {**self.salon, "subscription_status": "blocked", "paddle_customer_id": None}
+        with (
+            patch.object(salon_app, "validated_session_user", return_value=self.user),
+            patch.object(salon_app, "current_user", return_value=self.user),
+            patch.object(salon_app, "current_salon", return_value=salon),
+            patch.object(salon_app, "db_query", return_value={"id": salon["id"]}),
+            patch.object(salon_app, "salon_settings", return_value=salon_app.DEFAULT_SALON_SETTINGS),
+        ):
+            response = self.client.get("/subscription")
+        self.assertNotIn("Otvori Paddle portal", response.get_data(as_text=True))
+
     def test_valid_subscription_event_fetches_authoritative_data_and_updates_only_salon_id(self):
         connection, cursor = self.connection([{"id": 91}, {"id": 3}, {"id": 3}])
         authoritative = self.subscription(custom_data={"salon_id": "3", "email": "private@example.com"})
@@ -246,6 +284,102 @@ class PaddleIntegrationTests(unittest.TestCase):
         update_call = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
         self.assertIn("paddle_subscription_updated_at <= %s", update_call.args[0])
         connection.commit.assert_called_once()
+
+    def test_first_past_due_transition_sets_persisted_grace_deadline(self):
+        connection, cursor = self.connection([
+            {"id": 91},
+            {"id": 3, "subscription_status": "active", "subscription_grace_ends_at": None},
+            {"id": 3},
+        ])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription(status="past_due")),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+            patch.object(salon_app, "SUBSCRIPTION_GRACE_DAYS", 7),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_past_due", "event_type": "subscription.updated",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 200)
+        update = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
+        self.assertEqual(update.args[1][5], datetime(2026, 8, 12, 12, 30, tzinfo=timezone.utc))
+
+    def test_repeated_past_due_preserves_existing_grace_deadline(self):
+        existing = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        connection, cursor = self.connection([
+            {"id": 91},
+            {"id": 3, "subscription_status": "past_due", "subscription_grace_ends_at": existing},
+            {"id": 3},
+        ])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription(status="past_due")),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_past_due_again", "event_type": "subscription.updated",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 200)
+        update = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
+        self.assertIs(update.args[1][5], existing)
+
+    def test_active_recovery_clears_grace_deadline(self):
+        connection, cursor = self.connection([
+            {"id": 91},
+            {"id": 3, "subscription_status": "past_due", "subscription_grace_ends_at": datetime.now(timezone.utc)},
+            {"id": 3},
+        ])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription(status="active")),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_recovered", "event_type": "subscription.updated",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 200)
+        update = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
+        self.assertIsNone(update.args[1][5])
+
+    def test_event_timestamp_is_deterministic_fallback_for_missing_authoritative_timestamp(self):
+        connection, cursor = self.connection([
+            {"id": 91},
+            {"id": 3, "subscription_status": "active", "subscription_grace_ends_at": None},
+            {"id": 3},
+        ])
+        authoritative = self.subscription(status="past_due", updated_at=None)
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=authoritative),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+            patch.object(salon_app, "SUBSCRIPTION_GRACE_DAYS", 7),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_timestamp_fallback", "event_type": "subscription.updated",
+                "occurred_at": "2026-08-06T00:00:00Z", "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 200)
+        update = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
+        self.assertEqual(update.args[1][4], datetime(2026, 8, 6, tzinfo=timezone.utc))
+        self.assertEqual(update.args[1][5], datetime(2026, 8, 13, tzinfo=timezone.utc))
+
+    def test_missing_all_authoritative_timestamps_cannot_update_access(self):
+        connection, cursor = self.connection([{"id": 91}])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription(status="past_due", updated_at=None)),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_no_timestamp", "event_type": "subscription.updated",
+                "occurred_at": "invalid", "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+        connection.rollback.assert_called_once()
 
     def test_webhook_rejects_invalid_signature_before_database_write(self):
         with (

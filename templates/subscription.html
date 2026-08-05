@@ -5,7 +5,7 @@
     <div>
         <span class="eyebrow">Pretplata</span>
         <h1>Status naloga</h1>
-        <p class="lead">Izaberite mesečnu ili godišnju pretplatu i bezbedno završite kupovinu preko Paddle-a.</p>
+        <p class="lead">Pregled lokalnog statusa pretplate i bezbedno upravljanje naplatom preko Paddle-a.</p>
     </div>
 </div>
 
@@ -13,30 +13,60 @@
     <article class="stat-card glow">
         <span>Status</span>
         <strong>{{ current_salon.subscription_status|subscription_label }}</strong>
-        <small>Trenutni pristup aplikaciji</small>
+        <small>{% if subscription_access_allowed %}Pristup aplikaciji je dozvoljen{% else %}Pristup aplikaciji je ograničen{% endif %}</small>
     </article>
     <article class="stat-card">
         <span>Paket</span>
-        <strong>{{ plan_labels.get(current_salon.subscription_plan, current_salon.subscription_plan) }}</strong>
-        <small>Mesečni ili godišnji plan</small>
+        <strong>{{ plan_labels.get(current_salon.subscription_plan, "Nije određen") }}</strong>
+        <small>Trenutni plan naloga</small>
     </article>
+    {% if current_salon.subscription_status == "trial" %}
     <article class="stat-card">
         <span>Probni period do</span>
         <strong>{{ current_salon.trial_ends_at|date_sr }}</strong>
-        <small>Vazi samo za probni period</small>
+        <small>Uključujući prikazani datum</small>
     </article>
+    {% elif current_salon.subscription_status == "past_due" %}
     <article class="stat-card">
-        <span>Mesečno</span>
-        <strong>{{ monthly_price_eur|euro }}</strong>
-        <small>Plan za male salone</small>
+        <span>Rok za uplatu</span>
+        <strong>{{ current_salon.subscription_grace_ends_at|date_sr }}</strong>
+        <small>{% if subscription_access_allowed %}Pristup traje do ovog roka{% else %}Rok je istekao{% endif %}</small>
     </article>
-    <article class="stat-card">
-        <span>Godišnje</span>
-        <strong>{{ yearly_price_eur|euro }}</strong>
-        <small>Povoljnija godisnja opcija</small>
-    </article>
+    {% endif %}
 </section>
 
+<section class="panel">
+    {% if current_salon.subscription_status == "active" %}
+        <h2>Pretplata je aktivna</h2>
+        <p>Vaš nalog ima pun pristup. Za račun, način plaćanja ili promenu pretplate otvorite Paddle portal.</p>
+    {% elif current_salon.subscription_status == "trial" and subscription_access_allowed %}
+        <h2>Probni period je aktivan</h2>
+        <p>Možete koristiti aplikaciju do prikazanog datuma. Izaberite plan kada budete spremni.</p>
+    {% elif current_salon.subscription_status == "past_due" and subscription_access_allowed %}
+        <h2>Plaćanje zahteva pažnju</h2>
+        <p>Pristup je privremeno omogućen tokom roka za uplatu. Ažurirajte način plaćanja u Paddle portalu.</p>
+    {% elif current_salon.subscription_status == "past_due" %}
+        <h2>Pristup je ograničen</h2>
+        <p>Rok za uplatu je istekao. Otvorite Paddle portal da biste uredili plaćanje.</p>
+    {% elif current_salon.subscription_status in ["cancelled", "blocked"] %}
+        <h2>Pretplata nije aktivna</h2>
+        <p>Podaci su sačuvani. Upravljajte postojećom pretplatom u Paddle portalu ili izaberite novi plan kada je to dostupno.</p>
+    {% else %}
+        <h2>Pretplata zahteva pažnju</h2>
+        <p>Trenutno stanje ne dozvoljava pristup aplikaciji. Pokušajte upravljanje naplatom ili kontaktirajte podršku.</p>
+    {% endif %}
+
+    {% if portal_available %}
+    <form method="post" action="{{ url_for('paddle_customer_portal') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-primary" type="submit">Otvori Paddle portal</button>
+    </form>
+    {% elif current_salon.subscription_status in ["active", "past_due"] %}
+    <div class="flash flash-warning">Upravljanje naplatom još nije dostupno za ovaj nalog. Pokušajte ponovo kasnije.</div>
+    {% endif %}
+</section>
+
+{% if current_salon.subscription_status != "active" %}
 <section
     class="subscription-checkout"
     id="paddleCheckout"
@@ -48,47 +78,30 @@
     data-customer-email="{{ current_user.email }}"
 >
     {% if not paddle_checkout_available %}
-    <div class="flash flash-warning">
-        Online plaćanje trenutno nije dostupno. Probni period i postojeći pristup nalogu ostaju nepromenjeni.
-    </div>
+    <div class="flash flash-warning">Online plaćanje trenutno nije dostupno. Postojeći pristup nalogu ostaje nepromenjen.</div>
     {% endif %}
-
     <div class="subscription-plan-grid">
         <article class="panel subscription-plan accent-panel">
             <span class="eyebrow">Mesečno</span>
             <h2>{{ monthly_price_eur|euro }}</h2>
-            <p>Plaćanje svakog meseca, bez godišnje obaveze.</p>
-            <button class="btn btn-primary full paddle-checkout-button" type="button" data-plan="monthly" {% if not paddle_checkout_available %}disabled{% endif %}>
-                Izaberi mesečni plan
-            </button>
+            <p>Plaćanje svakog meseca.</p>
+            <button class="btn btn-primary full paddle-checkout-button" type="button" data-plan="monthly" {% if not paddle_checkout_available %}disabled{% endif %}>Izaberi mesečni plan</button>
         </article>
         <article class="panel subscription-plan">
             <span class="eyebrow">Godišnje</span>
             <h2>{{ yearly_price_eur|euro }}</h2>
-            <p>Jedno plaćanje za celu godinu po povoljnijoj ceni.</p>
-            <button class="btn btn-primary full paddle-checkout-button" type="button" data-plan="yearly" {% if not paddle_checkout_available %}disabled{% endif %}>
-                Izaberi godišnji plan
-            </button>
+            <p>Jedno plaćanje za celu godinu.</p>
+            <button class="btn btn-primary full paddle-checkout-button" type="button" data-plan="yearly" {% if not paddle_checkout_available %}disabled{% endif %}>Izaberi godišnji plan</button>
         </article>
     </div>
 </section>
+{% endif %}
 
-<div class="content-grid half">
-    <section class="panel">
-        <h2>Bezbedna naplata</h2>
-        <p>Klik na plan otvara Paddle checkout. Podaci kartice se unose direktno kod Paddle-a i ne prolaze kroz SalonPanel.</p>
-        <div class="mini-list">
-            <div><span>Okruženje</span><strong>{% if paddle_config.environment == "sandbox" %}Sandbox test{% elif paddle_config.environment == "production" %}Produkcija{% else %}Nije podešeno{% endif %}</strong></div>
-            <div><span>Probni period</span><strong>Ostaje aktivan do postojećeg datuma isteka</strong></div>
-            <div><span>Neaktivan nalog</span><strong>Podaci ostaju sačuvani, pristup se ograničava</strong></div>
-        </div>
-    </section>
-    <section class="panel">
-        <h2>Aktivacija pretplate</h2>
-        <p>Dok automatska sinhronizacija webhook događaja ne bude završena i proverena, postojeća ručna aktivacija u super admin panelu ostaje dostupna.</p>
-        <a class="btn btn-secondary" href="{{ url_for('public_booking', slug=current_salon.slug) }}" target="_blank">Otvori javno zakazivanje</a>
-    </section>
-</div>
+<section class="panel">
+    <h2>Bezbedna naplata</h2>
+    <p>Podaci kartice unose se direktno kod Paddle-a i ne prolaze kroz SalonPanel.</p>
+    <a class="btn btn-secondary" href="{{ url_for('public_booking', slug=current_salon.slug) }}" target="_blank" rel="noopener">Otvori javno zakazivanje</a>
+</section>
 {% endblock %}
 {% block scripts %}
 {% if paddle_checkout_available %}
