@@ -41,7 +41,7 @@ from phone_utils import normalize_phone
 APP_NAME = "SalonPanel"
 PRODUCTION_BASE_URL = "https://salonpanel.app"
 PUBLIC_NOINDEX_FOLLOW_ENDPOINTS = frozenset({"privacy_policy", "terms_of_service"})
-TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 MONTHLY_PRICE_EUR = float(os.environ.get("MONTHLY_PRICE_EUR", "19.99"))
 YEARLY_PRICE_EUR = float(os.environ.get("YEARLY_PRICE_EUR", "199.99"))
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Europe/Belgrade")

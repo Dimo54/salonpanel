@@ -86,7 +86,7 @@ Podrazumevane cene su:
 
 - mesečni plan: `19.99 EUR`;
 - godišnji plan: `199.99 EUR`;
-- probni period: `14 dana`.
+- probni period: `7 dana`.
 
 Online naplata još nije povezana. Status pretplate se i dalje može menjati ručno iz super admin panela.
 
@@ -133,7 +133,7 @@ Dobijenu vrednost stavi samo u Render Environment. Nemoj je postavljati na GitHu
 ### Cene i probni period
 
 ```text
-TRIAL_DAYS=14
+TRIAL_DAYS=7
 MONTHLY_PRICE_EUR=19.99
 YEARLY_PRICE_EUR=199.99
 ```

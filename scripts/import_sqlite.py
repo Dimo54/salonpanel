@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from datetime import date, timedelta
 
-TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
+TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 
 
 def import_owner_password():
