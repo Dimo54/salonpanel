@@ -1862,6 +1862,13 @@ input[readonly] {
         display: flex;
         align-items: center;
         gap: 10px;
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+    }
+
+    .mobile-brand > span:not(.brand-mark) {
+        flex: 1 1 auto;
         min-width: 0;
     }
 
@@ -1875,7 +1882,7 @@ input[readonly] {
     .mobile-brand strong,
     .mobile-brand small {
         display: block;
-        max-width: 58vw;
+        max-width: 100%;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1967,7 +1974,20 @@ input[readonly] {
     }
 
     .sidebar > .brand {
+        min-width: 0;
         padding-right: 48px;
+        overflow: hidden;
+    }
+
+    .sidebar > .brand > span:not(.brand-mark) {
+        min-width: 0;
+    }
+
+    .sidebar > .brand strong,
+    .sidebar > .brand small {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
 
     .sidebar-backdrop {
