@@ -88,7 +88,7 @@ Podrazumevane cene su:
 - godišnji plan: `199.99 EUR`;
 - probni period: `7 dana`.
 
-Online naplata još nije povezana. Status pretplate se i dalje može menjati ručno iz super admin panela.
+Mesečna i godišnja kupovina otvaraju Paddle Billing checkout. Webhook događaji se proveravaju i čuvaju, ali još ne menjaju automatski status pretplate. Status se do završetka te sinhronizacije i dalje može menjati ručno iz super admin panela.
 
 ## Da li je domen potreban?
 
@@ -139,6 +139,26 @@ YEARLY_PRICE_EUR=199.99
 ```
 
 Ove vrednosti postoje kao Environment promenljive da bi cena kasnije mogla da se promeni bez menjanja više delova koda.
+
+### Paddle Billing
+
+```text
+PADDLE_ENVIRONMENT=sandbox
+PADDLE_CLIENT_TOKEN=test_...
+PADDLE_API_KEY=pdl_sdbx_apikey_...
+PADDLE_MONTHLY_PRICE_ID=pri_...
+PADDLE_YEARLY_PRICE_ID=pri_...
+PADDLE_WEBHOOK_SECRET=pdl_ntfset_...
+PADDLE_WEBHOOK_TOLERANCE_SECONDS=5
+```
+
+- `PADDLE_ENVIRONMENT` mora biti `sandbox` ili `production`.
+- `PADDLE_CLIENT_TOKEN` i ID-jevi cena prosleđuju se Paddle.js stranici za checkout.
+- `PADDLE_API_KEY` ostaje isključivo na serveru i namenjen je budućoj sinhronizaciji pretplate preko Paddle API-ja.
+- `PADDLE_WEBHOOK_SECRET` je tajna notification destination-a iz Paddle kontrolne table. Ona je različita od API ključa i koristi se za proveru `Paddle-Signature` zaglavlja na `/webhooks/paddle`.
+- `PADDLE_WEBHOOK_TOLERANCE_SECONDS` određuje dozvoljeno odstupanje vremena potpisa i podrazumevano je `5` sekundi.
+
+Webhook trenutno proverava potpis i idempotentno čuva događaj u `subscription_events`, bez promene statusa salona. Ne uključuj ga kao završenu produkcijsku automatizaciju dok TODO sinhronizacija u `app.py` ne bude implementirana i testirana.
 
 ### Brevo email
 

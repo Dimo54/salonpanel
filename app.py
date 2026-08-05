@@ -3,9 +3,11 @@ import calendar as calendar_module
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
 import secrets
+import time as time_module
 import unicodedata
 from datetime import date, datetime, time, timedelta
 from functools import wraps
@@ -45,6 +47,17 @@ TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "7"))
 MONTHLY_PRICE_EUR = float(os.environ.get("MONTHLY_PRICE_EUR", "19.99"))
 YEARLY_PRICE_EUR = float(os.environ.get("YEARLY_PRICE_EUR", "199.99"))
 APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Europe/Belgrade")
+PADDLE_ENVIRONMENT = os.environ.get("PADDLE_ENVIRONMENT", "sandbox").strip().lower()
+PADDLE_CLIENT_TOKEN = os.environ.get("PADDLE_CLIENT_TOKEN", "").strip()
+PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY", "").strip()
+PADDLE_MONTHLY_PRICE_ID = os.environ.get("PADDLE_MONTHLY_PRICE_ID", "").strip()
+PADDLE_YEARLY_PRICE_ID = os.environ.get("PADDLE_YEARLY_PRICE_ID", "").strip()
+# Paddle signs webhook requests with a notification destination secret, not the API key.
+PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "").strip()
+PADDLE_WEBHOOK_TOLERANCE_SECONDS = max(
+    0,
+    int(os.environ.get("PADDLE_WEBHOOK_TOLERANCE_SECONDS", "5")),
+)
 BOOKING_SLOT_MINUTES = 10
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
@@ -378,6 +391,7 @@ def init_db():
         id SERIAL PRIMARY KEY,
         salon_id INTEGER REFERENCES salons(id) ON DELETE CASCADE,
         provider TEXT NOT NULL DEFAULT 'manual',
+        paddle_event_id TEXT,
         event_type TEXT NOT NULL,
         payload JSONB,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -468,6 +482,7 @@ def init_db():
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS contact_source TEXT;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS privacy_consent_at TIMESTAMP;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN;
+    ALTER TABLE subscription_events ADD COLUMN IF NOT EXISTS paddle_event_id TEXT;
 
     UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
     UPDATE appointments a
@@ -493,6 +508,9 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_appointments_worker_date ON appointments(worker_id, date, time);
     CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_appointments_public_token ON appointments(public_token) WHERE public_token IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_events_paddle_event_id
+        ON subscription_events(provider, paddle_event_id)
+        WHERE paddle_event_id IS NOT NULL;
     """
     with get_db().cursor() as cur:
         cur.execute(schema)
@@ -946,7 +964,7 @@ def csrf_token():
 
 @app.before_request
 def protect_csrf():
-    if request.endpoint == "send_reminders_task":
+    if request.endpoint in {"send_reminders_task", "paddle_webhook"}:
         return None
     if request.method in ("POST", "PUT", "PATCH", "DELETE"):
         if (
@@ -973,6 +991,8 @@ def add_security_headers(response):
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    paddle_script_source = " https://cdn.paddle.com" if request.endpoint == "subscription_page" else ""
+    paddle_runtime_sources = " https://paddle.com https://*.paddle.com" if request.endpoint == "subscription_page" else ""
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; "
@@ -980,11 +1000,12 @@ def add_security_headers(response):
         "object-src 'none'; "
         "frame-ancestors 'none'; "
         "form-action 'self'; "
-        "script-src 'self'; "
+        f"script-src 'self'{paddle_script_source}; "
         "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; "
+        f"img-src 'self' data:{paddle_runtime_sources}; "
         "font-src 'self'; "
-        "connect-src 'self'",
+        f"connect-src 'self'{paddle_runtime_sources}; "
+        f"frame-src 'self'{paddle_runtime_sources}",
     )
     if request.is_secure:
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
@@ -3644,7 +3665,80 @@ def settings_page():
 @app.route("/subscription")
 @salon_required
 def subscription_page():
-    return render_template("subscription.html")
+    paddle_environment = PADDLE_ENVIRONMENT if PADDLE_ENVIRONMENT in {"sandbox", "production"} else ""
+    paddle_config = {
+        "environment": paddle_environment,
+        "client_token": PADDLE_CLIENT_TOKEN,
+        "monthly_price_id": PADDLE_MONTHLY_PRICE_ID,
+        "yearly_price_id": PADDLE_YEARLY_PRICE_ID,
+    }
+    return render_template(
+        "subscription.html",
+        paddle_config=paddle_config,
+        paddle_checkout_available=all(paddle_config.values()),
+    )
+
+
+def paddle_webhook_signature_is_valid(raw_body, signature_header):
+    if not PADDLE_WEBHOOK_SECRET or not signature_header:
+        return False
+
+    parts = {}
+    for item in signature_header.split(";"):
+        key, separator, value = item.partition("=")
+        if separator and key and value:
+            parts.setdefault(key, []).append(value)
+
+    try:
+        timestamp = int(parts.get("ts", [""])[0])
+    except (TypeError, ValueError):
+        return False
+    if abs(int(time_module.time()) - timestamp) > PADDLE_WEBHOOK_TOLERANCE_SECONDS:
+        return False
+
+    signed_payload = str(timestamp).encode("utf-8") + b":" + raw_body
+    expected = hmac.new(
+        PADDLE_WEBHOOK_SECRET.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+    return any(hmac.compare_digest(expected, signature) for signature in parts.get("h1", []))
+
+
+@app.route("/webhooks/paddle", methods=["POST"])
+def paddle_webhook():
+    if not PADDLE_WEBHOOK_SECRET:
+        return jsonify({"ok": False, "error": "Paddle webhook nije konfigurisan."}), 503
+
+    raw_body = request.get_data(cache=True)
+    if not paddle_webhook_signature_is_valid(raw_body, request.headers.get("Paddle-Signature", "")):
+        return jsonify({"ok": False, "error": "Neispravan Paddle potpis."}), 401
+
+    event = request.get_json(silent=True)
+    event_id = event.get("event_id") if isinstance(event, dict) else None
+    event_type = event.get("event_type") if isinstance(event, dict) else None
+    if (
+        not isinstance(event_id, str)
+        or not event_id.strip()
+        or not isinstance(event_type, str)
+        or not event_type.strip()
+    ):
+        return jsonify({"ok": False, "error": "Neispravan Paddle dogadjaj."}), 400
+
+    db_execute(
+        """
+        INSERT INTO subscription_events (provider, paddle_event_id, event_type, payload)
+        VALUES ('paddle', %s, %s, %s::jsonb)
+        ON CONFLICT (provider, paddle_event_id) WHERE paddle_event_id IS NOT NULL
+        DO NOTHING
+        """,
+        (event_id.strip(), event_type.strip(), json.dumps(event)),
+    )
+
+    # TODO: Use PADDLE_API_KEY to fetch the authoritative Paddle subscription or
+    # transaction, map its custom_data salon_id safely, make processing idempotent,
+    # and then update salons.subscription_status/plan/customer/subscription IDs.
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/zakazi")

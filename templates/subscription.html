@@ -5,7 +5,7 @@
     <div>
         <span class="eyebrow">Pretplata</span>
         <h1>Status naloga</h1>
-        <p class="lead">Ovde salon vidi svoj paket. Paddle online naplata se dodaje u sledecem koraku.</p>
+        <p class="lead">Izaberite mesečnu ili godišnju pretplatu i bezbedno završite kupovinu preko Paddle-a.</p>
     </div>
 </div>
 
@@ -37,20 +37,62 @@
     </article>
 </section>
 
+<section
+    class="subscription-checkout"
+    id="paddleCheckout"
+    data-environment="{{ paddle_config.environment }}"
+    data-client-token="{{ paddle_config.client_token }}"
+    data-monthly-price-id="{{ paddle_config.monthly_price_id }}"
+    data-yearly-price-id="{{ paddle_config.yearly_price_id }}"
+    data-salon-id="{{ current_salon.id }}"
+    data-customer-email="{{ current_user.email }}"
+>
+    {% if not paddle_checkout_available %}
+    <div class="flash flash-warning">
+        Online plaćanje trenutno nije dostupno. Probni period i postojeći pristup nalogu ostaju nepromenjeni.
+    </div>
+    {% endif %}
+
+    <div class="subscription-plan-grid">
+        <article class="panel subscription-plan accent-panel">
+            <span class="eyebrow">Mesečno</span>
+            <h2>{{ monthly_price_eur|euro }}</h2>
+            <p>Plaćanje svakog meseca, bez godišnje obaveze.</p>
+            <button class="btn btn-primary full paddle-checkout-button" type="button" data-plan="monthly" {% if not paddle_checkout_available %}disabled{% endif %}>
+                Izaberi mesečni plan
+            </button>
+        </article>
+        <article class="panel subscription-plan">
+            <span class="eyebrow">Godišnje</span>
+            <h2>{{ yearly_price_eur|euro }}</h2>
+            <p>Jedno plaćanje za celu godinu po povoljnijoj ceni.</p>
+            <button class="btn btn-primary full paddle-checkout-button" type="button" data-plan="yearly" {% if not paddle_checkout_available %}disabled{% endif %}>
+                Izaberi godišnji plan
+            </button>
+        </article>
+    </div>
+</section>
+
 <div class="content-grid half">
-    <section class="panel accent-panel">
-        <h2>Kako ce raditi naplata</h2>
-        <p>Kada dodamo Paddle, salon ce ovde moci da klikne na mesecni ili godišnji paket, plati karticom, a aplikacija ce automatski promeniti status pretplate.</p>
+    <section class="panel">
+        <h2>Bezbedna naplata</h2>
+        <p>Klik na plan otvara Paddle checkout. Podaci kartice se unose direktno kod Paddle-a i ne prolaze kroz SalonPanel.</p>
         <div class="mini-list">
-            <div><span>Mesečni plan</span><strong>{{ monthly_price_eur|euro }} / mesec</strong></div>
-            <div><span>Godisnji plan</span><strong>{{ yearly_price_eur|euro }} / godina</strong></div>
-            <div><span>Neplacen nalog</span><strong>Podaci ostaju sacuvani, pristup se ogranicava</strong></div>
+            <div><span>Okruženje</span><strong>{% if paddle_config.environment == "sandbox" %}Sandbox test{% elif paddle_config.environment == "production" %}Produkcija{% else %}Nije podešeno{% endif %}</strong></div>
+            <div><span>Probni period</span><strong>Ostaje aktivan do postojećeg datuma isteka</strong></div>
+            <div><span>Neaktivan nalog</span><strong>Podaci ostaju sačuvani, pristup se ograničava</strong></div>
         </div>
     </section>
     <section class="panel">
-        <h2>Ručna aktivacija za test</h2>
-        <p>Dok ne povezemo online plaćanje, vlasnik platforme moze u super admin panelu rucno da promeni status ovog salona u aktivan, trial, past due ili blokiran.</p>
+        <h2>Aktivacija pretplate</h2>
+        <p>Dok automatska sinhronizacija webhook događaja ne bude završena i proverena, postojeća ručna aktivacija u super admin panelu ostaje dostupna.</p>
         <a class="btn btn-secondary" href="{{ url_for('public_booking', slug=current_salon.slug) }}" target="_blank">Otvori javno zakazivanje</a>
     </section>
 </div>
+{% endblock %}
+{% block scripts %}
+{% if paddle_checkout_available %}
+<script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
+<script src="{{ url_for('static', filename='js/subscription.js') }}"></script>
+{% endif %}
 {% endblock %}

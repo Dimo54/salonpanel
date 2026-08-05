@@ -250,6 +250,12 @@ h3 {
     background: rgba(255, 255, 255, 0.12);
 }
 
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
 .btn-primary {
     border-color: transparent;
     background: linear-gradient(135deg, var(--primary), var(--primary-2));
@@ -479,6 +485,30 @@ h3 {
 
 .mini-list strong {
     word-break: break-word;
+}
+
+.subscription-checkout {
+    margin-bottom: 18px;
+}
+
+.subscription-plan-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+}
+
+.subscription-plan {
+    display: grid;
+    gap: 14px;
+}
+
+.subscription-plan h2,
+.subscription-plan p {
+    margin-bottom: 0;
+}
+
+.subscription-plan h2 {
+    font-size: clamp(30px, 4vw, 42px);
 }
 
 .table-wrap {
@@ -1839,6 +1869,10 @@ input[readonly] {
 
 @media (max-width: 880px) {
     .stat-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .subscription-plan-grid {
         grid-template-columns: 1fr;
     }
 }

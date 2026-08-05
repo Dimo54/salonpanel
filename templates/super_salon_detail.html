@@ -47,7 +47,7 @@
 <div class="content-grid half">
     <section class="panel accent-panel">
         <h2>Pretplata</h2>
-        <p>Do Paddle integracije status se moze rucno menjati ovde. Kasnije ce ovo automatski raditi webhook nakon placanja.</p>
+        <p>Do završetka Paddle webhook sinhronizacije status se može ručno menjati ovde. Kasnije će se automatski ažurirati nakon plaćanja.</p>
         <form method="post" action="{{ url_for('super_admin_update_subscription', salon_id=salon.id) }}" class="smart-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="form-grid single">

@@ -65,7 +65,7 @@
             <div class="sidebar-card">
                 <span class="muted">Naplata</span>
                 <a href="{{ url_for('super_admin_salons') }}?status=active">Aktivne pretplate</a>
-                <small>Do Paddle integracije statuse menjas rucno iz super admin panela.</small>
+                <small>Do završetka Paddle webhook sinhronizacije statuse menjaš ručno iz super admin panela.</small>
             </div>
             {% else %}
             {% if current_user and current_user.role == 'super_admin' and current_salon %}
