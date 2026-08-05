@@ -12,6 +12,7 @@ import unicodedata
 from datetime import date, datetime, time, timedelta
 from functools import wraps
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -57,6 +58,10 @@ PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "").strip()
 PADDLE_WEBHOOK_TOLERANCE_SECONDS = max(
     0,
     int(os.environ.get("PADDLE_WEBHOOK_TOLERANCE_SECONDS", "5")),
+)
+PADDLE_API_TIMEOUT_SECONDS = 10
+PADDLE_SUBSCRIPTION_EVENT_TYPES = frozenset(
+    {"subscription.created", "subscription.updated", "subscription.canceled"}
 )
 BOOKING_SLOT_MINUTES = 10
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -286,6 +291,7 @@ def init_db():
         trial_ends_at DATE,
         paddle_customer_id TEXT,
         paddle_subscription_id TEXT,
+        paddle_subscription_updated_at TIMESTAMPTZ,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -483,6 +489,7 @@ def init_db():
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS privacy_consent_at TIMESTAMP;
     ALTER TABLE appointments ADD COLUMN IF NOT EXISTS marketing_consent BOOLEAN;
     ALTER TABLE subscription_events ADD COLUMN IF NOT EXISTS paddle_event_id TEXT;
+    ALTER TABLE salons ADD COLUMN IF NOT EXISTS paddle_subscription_updated_at TIMESTAMPTZ;
 
     UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
     UPDATE appointments a
@@ -3705,6 +3712,96 @@ def paddle_webhook_signature_is_valid(raw_body, signature_header):
     return any(hmac.compare_digest(expected, signature) for signature in parts.get("h1", []))
 
 
+class PaddleProcessingError(Exception):
+    def __init__(self, message, status_code):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def fetch_paddle_subscription(subscription_id):
+    if not PADDLE_API_KEY:
+        raise PaddleProcessingError("Paddle API nije konfigurisan.", 503)
+    if PADDLE_ENVIRONMENT == "sandbox":
+        api_base = "https://sandbox-api.paddle.com"
+    elif PADDLE_ENVIRONMENT == "production":
+        api_base = "https://api.paddle.com"
+    else:
+        raise PaddleProcessingError("Paddle okruzenje nije ispravno.", 503)
+
+    api_request = Request(
+        f"{api_base}/subscriptions/{subscription_id}",
+        headers={
+            "Authorization": f"Bearer {PADDLE_API_KEY}",
+            "Accept": "application/json",
+            "Paddle-Version": "1",
+        },
+    )
+    try:
+        with urlopen(api_request, timeout=PADDLE_API_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read())
+    except Exception:
+        # Never include the exception: HTTP clients can echo headers or response bodies.
+        app.logger.warning("Paddle subscription retrieval failed.")
+        raise PaddleProcessingError("Paddle pretplata trenutno nije dostupna.", 502)
+    subscription = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(subscription, dict):
+        raise PaddleProcessingError("Paddle pretplata nije ispravna.", 502)
+    return subscription
+
+
+def positive_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 < value <= 2147483647 else None
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
+        parsed = int(value)
+        return parsed if parsed <= 2147483647 else None
+    return None
+
+
+def paddle_subscription_status(value):
+    return {
+        "active": "active",
+        "trialing": "active",
+        "past_due": "past_due",
+        "paused": "blocked",
+        "canceled": "cancelled",
+    }.get(value, "blocked")
+
+
+def paddle_subscription_plan(subscription):
+    items = subscription.get("items")
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        price = item.get("price") if isinstance(item, dict) else None
+        if not isinstance(price, dict):
+            continue
+        price_id = price.get("id")
+        if price_id and price_id == PADDLE_MONTHLY_PRICE_ID:
+            return "monthly"
+        if price_id and price_id == PADDLE_YEARLY_PRICE_ID:
+            return "yearly"
+    billing_cycle = subscription.get("billing_cycle")
+    interval = billing_cycle.get("interval") if isinstance(billing_cycle, dict) else None
+    if interval == "month":
+        return "monthly"
+    if interval == "year":
+        return "yearly"
+    return None
+
+
+def paddle_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 @app.route("/webhooks/paddle", methods=["POST"])
 def paddle_webhook():
     if not PADDLE_WEBHOOK_SECRET:
@@ -3725,20 +3822,112 @@ def paddle_webhook():
     ):
         return jsonify({"ok": False, "error": "Neispravan Paddle dogadjaj."}), 400
 
-    db_execute(
-        """
-        INSERT INTO subscription_events (provider, paddle_event_id, event_type, payload)
-        VALUES ('paddle', %s, %s, %s::jsonb)
-        ON CONFLICT (provider, paddle_event_id) WHERE paddle_event_id IS NOT NULL
-        DO NOTHING
-        """,
-        (event_id.strip(), event_type.strip(), json.dumps(event)),
-    )
+    event_id = event_id.strip()
+    event_type = event_type.strip()
+    data = event.get("data")
+    subscription_id = data.get("id") if isinstance(data, dict) else None
+    safe_payload = {
+        "event_id": event_id,
+        "event_type": event_type,
+        "occurred_at": event.get("occurred_at"),
+        "subscription_id": subscription_id,
+    }
 
-    # TODO: Use PADDLE_API_KEY to fetch the authoritative Paddle subscription or
-    # transaction, map its custom_data salon_id safely, make processing idempotent,
-    # and then update salons.subscription_status/plan/customer/subscription IDs.
-    return jsonify({"ok": True}), 200
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subscription_events (provider, paddle_event_id, event_type, payload)
+                VALUES ('paddle', %s, %s, %s::jsonb)
+                ON CONFLICT (provider, paddle_event_id) WHERE paddle_event_id IS NOT NULL
+                DO NOTHING
+                RETURNING id
+                """,
+                (event_id, event_type, json.dumps(safe_payload)),
+            )
+            inserted_event = cur.fetchone()
+            if not inserted_event:
+                connection.commit()
+                return jsonify({"ok": True, "duplicate": True}), 200
+
+            if event_type not in PADDLE_SUBSCRIPTION_EVENT_TYPES:
+                connection.commit()
+                return jsonify({"ok": True, "ignored": True}), 200
+
+            if (
+                not isinstance(subscription_id, str)
+                or not re.fullmatch(r"sub_[A-Za-z0-9]+", subscription_id)
+            ):
+                raise PaddleProcessingError("Nedostaje ID Paddle pretplate.", 400)
+            subscription = fetch_paddle_subscription(subscription_id)
+            custom_data = subscription.get("custom_data")
+            salon_id = positive_int(
+                custom_data.get("salon_id") if isinstance(custom_data, dict) else None
+            )
+            if salon_id is None:
+                raise PaddleProcessingError("Neispravan salon_id.", 400)
+
+            authoritative_id = subscription.get("id")
+            customer_id = subscription.get("customer_id")
+            source_updated_at = paddle_timestamp(subscription.get("updated_at"))
+            plan = paddle_subscription_plan(subscription)
+            if (
+                not isinstance(authoritative_id, str)
+                or authoritative_id != subscription_id
+                or not isinstance(customer_id, str)
+                or not customer_id.strip()
+                or source_updated_at is None
+                or plan is None
+            ):
+                raise PaddleProcessingError("Paddle pretplata nije ispravna.", 502)
+
+            cur.execute(
+                "SELECT id FROM salons WHERE id = %s FOR UPDATE",
+                (salon_id,),
+            )
+            if not cur.fetchone():
+                raise PaddleProcessingError("Salon nije pronadjen.", 404)
+
+            cur.execute(
+                """
+                UPDATE salons
+                SET subscription_status = %s,
+                    subscription_plan = %s,
+                    paddle_customer_id = %s,
+                    paddle_subscription_id = %s,
+                    paddle_subscription_updated_at = %s,
+                    updated_at = %s
+                WHERE id = %s
+                  AND (paddle_subscription_updated_at IS NULL
+                       OR paddle_subscription_updated_at <= %s)
+                RETURNING id
+                """,
+                (
+                    paddle_subscription_status(subscription.get("status")),
+                    plan,
+                    customer_id.strip(),
+                    authoritative_id,
+                    source_updated_at,
+                    datetime.now(),
+                    salon_id,
+                    source_updated_at,
+                ),
+            )
+            cur.fetchone()  # A stale event is recorded but cannot regress salon state.
+            cur.execute(
+                "UPDATE subscription_events SET salon_id = %s WHERE id = %s",
+                (salon_id, inserted_event["id"]),
+            )
+        connection.commit()
+        return jsonify({"ok": True}), 200
+    except PaddleProcessingError as exc:
+        connection.rollback()
+        return jsonify({"ok": False, "error": str(exc)}), exc.status_code
+    except Exception:
+        connection.rollback()
+        app.logger.exception("Paddle webhook database processing failed.")
+        return jsonify({"ok": False, "error": "Paddle dogadjaj nije obradjen."}), 500
 
 
 @app.route("/zakazi")

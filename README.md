@@ -154,11 +154,11 @@ PADDLE_WEBHOOK_TOLERANCE_SECONDS=5
 
 - `PADDLE_ENVIRONMENT` mora biti `sandbox` ili `production`.
 - `PADDLE_CLIENT_TOKEN` i ID-jevi cena prosleđuju se Paddle.js stranici za checkout.
-- `PADDLE_API_KEY` ostaje isključivo na serveru i namenjen je budućoj sinhronizaciji pretplate preko Paddle API-ja.
+- `PADDLE_API_KEY` ostaje isključivo na serveru i koristi se za proveru trenutnog stanja pretplate preko Paddle API-ja pre izmene salona.
 - `PADDLE_WEBHOOK_SECRET` je tajna notification destination-a iz Paddle kontrolne table. Ona je različita od API ključa i koristi se za proveru `Paddle-Signature` zaglavlja na `/webhooks/paddle`.
 - `PADDLE_WEBHOOK_TOLERANCE_SECONDS` određuje dozvoljeno odstupanje vremena potpisa i podrazumevano je `5` sekundi.
 
-Webhook trenutno proverava potpis i idempotentno čuva događaj u `subscription_events`, bez promene statusa salona. Ne uključuj ga kao završenu produkcijsku automatizaciju dok TODO sinhronizacija u `app.py` ne bude implementirana i testirana.
+Webhook proverava potpis, idempotentno čuva podržane događaje i sinhronizuje salon isključivo iz autoritativne Paddle pretplate. Nepodržani događaji se beleže i ignorišu.
 
 ### Brevo email
 

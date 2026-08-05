@@ -5,7 +5,7 @@ import os
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-that-is-not-used-outside-tests")
@@ -35,6 +35,55 @@ class PaddleIntegrationTests(unittest.TestCase):
             "subscription_plan": "trial",
             "trial_ends_at": date.today() + timedelta(days=7),
         }
+
+    def signed_post(self, payload, **patches):
+        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        timestamp = 1_900_000_000
+        secret = "notification-secret"
+        signature = hmac.new(
+            secret.encode("utf-8"),
+            str(timestamp).encode("utf-8") + b":" + raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        defaults = {
+            "PADDLE_WEBHOOK_SECRET": secret,
+            "PADDLE_WEBHOOK_TOLERANCE_SECONDS": 5,
+        }
+        defaults.update(patches)
+        active_patches = [patch.object(salon_app, name, value) for name, value in defaults.items()]
+        with patch.object(salon_app.time_module, "time", return_value=timestamp):
+            for active_patch in active_patches:
+                active_patch.start()
+            try:
+                return self.client.post(
+                    "/webhooks/paddle",
+                    data=raw_body,
+                    content_type="application/json",
+                    headers={"Paddle-Signature": f"ts={timestamp};h1={signature}"},
+                )
+            finally:
+                for active_patch in reversed(active_patches):
+                    active_patch.stop()
+
+    def connection(self, fetches):
+        connection = MagicMock()
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.side_effect = fetches
+        connection.cursor.return_value = cursor
+        return connection, cursor
+
+    def subscription(self, **changes):
+        value = {
+            "id": "sub_123",
+            "customer_id": "ctm_123",
+            "status": "active",
+            "updated_at": "2026-08-05T12:30:00Z",
+            "custom_data": {"salon_id": "3"},
+            "items": [{"price": {"id": "pri_monthly"}}],
+        }
+        value.update(changes)
+        return value
 
     def test_subscription_page_exposes_only_safe_checkout_configuration(self):
         with (
@@ -79,43 +128,130 @@ class PaddleIntegrationTests(unittest.TestCase):
         self.assertNotIn("https://cdn.paddle.com/paddle/v2/paddle.js", body)
         self.assertIn("Probni period", body)
 
-    def test_signed_webhook_is_recorded_without_changing_subscription(self):
-        payload = {"event_id": "evt_123", "event_type": "subscription.created", "data": {}}
-        raw_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        timestamp = 1_900_000_000
-        secret = "notification-secret"
-        signature = hmac.new(
-            secret.encode("utf-8"),
-            str(timestamp).encode("utf-8") + b":" + raw_body,
-            hashlib.sha256,
-        ).hexdigest()
-
+    def test_valid_subscription_event_fetches_authoritative_data_and_updates_only_salon_id(self):
+        connection, cursor = self.connection([{"id": 91}, {"id": 3}, {"id": 3}])
+        authoritative = self.subscription(custom_data={"salon_id": "3", "email": "private@example.com"})
         with (
-            patch.object(salon_app, "PADDLE_API_KEY", ""),
-            patch.object(salon_app, "PADDLE_WEBHOOK_SECRET", secret),
-            patch.object(salon_app, "PADDLE_WEBHOOK_TOLERANCE_SECONDS", 5),
-            patch.object(salon_app.time_module, "time", return_value=timestamp),
-            patch.object(salon_app, "db_execute") as db_execute,
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=authoritative) as fetch,
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
         ):
-            response = self.client.post(
-                "/webhooks/paddle",
-                data=raw_body,
-                content_type="application/json",
-                headers={"Paddle-Signature": f"ts={timestamp};h1={signature}"},
-            )
+            response = self.signed_post({
+                "event_id": "evt_123",
+                "event_type": "subscription.created",
+                "data": {"id": "sub_123", "custom_data": {"salon_id": 999}},
+            })
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {"ok": True})
-        db_execute.assert_called_once()
-        self.assertIn("INSERT INTO subscription_events", db_execute.call_args.args[0])
-        self.assertIn("ON CONFLICT (provider, paddle_event_id)", db_execute.call_args.args[0])
-        self.assertEqual(db_execute.call_args.args[1][0], "evt_123")
-        self.assertEqual(db_execute.call_args.args[1][1], "subscription.created")
+        fetch.assert_called_once_with("sub_123")
+        update_call = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
+        self.assertEqual(update_call.args[1][0:4], ("active", "monthly", "ctm_123", "sub_123"))
+        self.assertEqual(update_call.args[1][6], 3)
+        self.assertNotIn("private@example.com", str(cursor.execute.call_args_list))
+        connection.commit.assert_called_once()
+        connection.rollback.assert_not_called()
+
+    def test_duplicate_event_is_idempotent_without_api_or_salon_update(self):
+        connection, cursor = self.connection([None])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription") as fetch,
+        ):
+            response = self.signed_post({
+                "event_id": "evt_duplicate", "event_type": "subscription.updated",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["duplicate"])
+        fetch.assert_not_called()
+        self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+        connection.commit.assert_called_once()
+
+    def test_missing_or_malformed_authoritative_salon_id_rolls_back_without_update(self):
+        for salon_id in (None, 0, -1, True, " 3", "3.0"):
+            with self.subTest(salon_id=salon_id):
+                connection, cursor = self.connection([{"id": 91}])
+                custom_data = {} if salon_id is None else {"salon_id": salon_id}
+                with (
+                    patch.object(salon_app, "get_db", return_value=connection),
+                    patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription(custom_data=custom_data)),
+                ):
+                    response = self.signed_post({
+                        "event_id": f"evt_bad_{salon_id}", "event_type": "subscription.updated",
+                        "data": {"id": "sub_123"},
+                    })
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+                connection.rollback.assert_called_once()
+
+    def test_unknown_salon_rolls_back_without_update(self):
+        connection, cursor = self.connection([{"id": 91}, None])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription()),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_unknown", "event_type": "subscription.updated",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+        connection.rollback.assert_called_once()
+
+    def test_paddle_api_failure_rolls_back_and_returns_retryable_error(self):
+        connection, cursor = self.connection([{"id": 91}])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", side_effect=salon_app.PaddleProcessingError("unavailable", 502)),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_api_failure", "event_type": "subscription.updated",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 502)
+        connection.rollback.assert_called_once()
+        connection.commit.assert_not_called()
+        self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+
+    def test_unsupported_event_is_recorded_with_minimal_payload_and_ignored(self):
+        connection, cursor = self.connection([{"id": 91}])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription") as fetch,
+        ):
+            response = self.signed_post({
+                "event_id": "evt_transaction", "event_type": "transaction.completed",
+                "data": {"id": "txn_123", "customer_email": "private@example.com"},
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ignored"])
+        fetch.assert_not_called()
+        insert_payload = cursor.execute.call_args_list[0].args[1][2]
+        self.assertNotIn("private@example.com", insert_payload)
+        connection.commit.assert_called_once()
+
+    def test_stale_delivery_uses_timestamp_guard(self):
+        connection, cursor = self.connection([{"id": 91}, {"id": 3}, None])
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=self.subscription(status="canceled")),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_stale", "event_type": "subscription.canceled",
+                "data": {"id": "sub_123"},
+            })
+        self.assertEqual(response.status_code, 200)
+        update_call = next(call for call in cursor.execute.call_args_list if "UPDATE salons" in call.args[0])
+        self.assertIn("paddle_subscription_updated_at <= %s", update_call.args[0])
+        connection.commit.assert_called_once()
 
     def test_webhook_rejects_invalid_signature_before_database_write(self):
         with (
             patch.object(salon_app, "PADDLE_WEBHOOK_SECRET", "notification-secret"),
-            patch.object(salon_app, "db_execute") as db_execute,
+            patch.object(salon_app, "get_db") as get_db,
+            patch.object(salon_app, "fetch_paddle_subscription") as fetch,
         ):
             response = self.client.post(
                 "/webhooks/paddle",
@@ -125,7 +261,8 @@ class PaddleIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 401)
-        db_execute.assert_not_called()
+        get_db.assert_not_called()
+        fetch.assert_not_called()
 
     def test_webhook_timestamp_tolerance_uses_unix_time(self):
         raw_body = b'{"event_id":"evt_old","event_type":"subscription.created"}'
@@ -141,7 +278,7 @@ class PaddleIntegrationTests(unittest.TestCase):
             patch.object(salon_app, "PADDLE_WEBHOOK_SECRET", secret),
             patch.object(salon_app, "PADDLE_WEBHOOK_TOLERANCE_SECONDS", 5),
             patch.object(salon_app.time_module, "time", return_value=timestamp + 6) as unix_time,
-            patch.object(salon_app, "db_execute") as db_execute,
+            patch.object(salon_app, "get_db") as get_db,
         ):
             response = self.client.post(
                 "/webhooks/paddle",
@@ -152,7 +289,29 @@ class PaddleIntegrationTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 401)
         unix_time.assert_called_once_with()
-        db_execute.assert_not_called()
+        get_db.assert_not_called()
+
+    def test_api_failure_logging_does_not_expose_secret_or_response_payload(self):
+        secret = "pdl_secret_api_key"
+        with (
+            patch.object(salon_app, "PADDLE_API_KEY", secret),
+            patch.object(salon_app, "PADDLE_ENVIRONMENT", "sandbox"),
+            patch.object(salon_app, "urlopen", side_effect=RuntimeError("private@example.com")),
+            patch.object(salon_app.app.logger, "warning") as warning,
+            self.assertRaises(salon_app.PaddleProcessingError),
+        ):
+            salon_app.fetch_paddle_subscription("sub_123")
+        logged = str(warning.call_args)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("private@example.com", logged)
+
+    def test_status_mapping_preserves_existing_access_semantics(self):
+        self.assertEqual(salon_app.paddle_subscription_status("active"), "active")
+        self.assertEqual(salon_app.paddle_subscription_status("trialing"), "active")
+        self.assertEqual(salon_app.paddle_subscription_status("past_due"), "past_due")
+        self.assertEqual(salon_app.paddle_subscription_status("paused"), "blocked")
+        self.assertEqual(salon_app.paddle_subscription_status("canceled"), "cancelled")
+        self.assertEqual(salon_app.paddle_subscription_status("future_status"), "blocked")
 
     def test_paddle_event_id_migration_is_additive_and_unique(self):
         migration = Path("migrations/20260805_add_paddle_event_id.sql").read_text(
@@ -174,6 +333,11 @@ class PaddleIntegrationTests(unittest.TestCase):
             "ON subscription_events(provider, paddle_event_id)",
             source,
         )
+
+    def test_subscription_timestamp_migration_is_additive(self):
+        migration = Path("migrations/20260805_add_paddle_subscription_updated_at.sql").read_text(encoding="utf-8")
+        self.assertIn("ADD COLUMN IF NOT EXISTS paddle_subscription_updated_at TIMESTAMPTZ", migration)
+        self.assertNotRegex(migration.upper(), r"\bUPDATE\b|\bDELETE\b")
 
 
 if __name__ == "__main__":
