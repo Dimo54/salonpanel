@@ -76,6 +76,50 @@ document.addEventListener("DOMContentLoaded", function () {
         });
     });
 
+    var deleteDialog = document.querySelector("[data-salon-delete-dialog]");
+    var deleteOpen = document.querySelector("[data-salon-delete-open]");
+    if (deleteDialog && deleteOpen) {
+        var warningStep = deleteDialog.querySelector("[data-delete-warning-step]");
+        var nameStep = deleteDialog.querySelector("[data-delete-name-step]");
+        var nameInput = deleteDialog.querySelector("[data-salon-name-input]");
+        var deleteSubmit = deleteDialog.querySelector("[data-salon-delete-submit]");
+        var expectedName = deleteDialog.getAttribute("data-salon-name") || "";
+
+        function showDeleteStep(requireName) {
+            warningStep.hidden = requireName;
+            nameStep.hidden = !requireName;
+            if (requireName) {
+                nameInput.focus();
+            }
+        }
+
+        function closeDeleteDialog() {
+            deleteDialog.close();
+            nameInput.value = "";
+            deleteSubmit.disabled = true;
+            showDeleteStep(false);
+        }
+
+        deleteOpen.addEventListener("click", function () {
+            showDeleteStep(false);
+            deleteDialog.showModal();
+        });
+        deleteDialog.querySelector("[data-salon-delete-cancel]").addEventListener("click", closeDeleteDialog);
+        deleteDialog.querySelector("[data-salon-delete-continue]").addEventListener("click", function () {
+            showDeleteStep(true);
+        });
+        deleteDialog.querySelector("[data-salon-delete-back]").addEventListener("click", function () {
+            showDeleteStep(false);
+        });
+        nameInput.addEventListener("input", function () {
+            deleteSubmit.disabled = nameInput.value !== expectedName;
+        });
+        deleteDialog.addEventListener("cancel", function (event) {
+            event.preventDefault();
+            closeDeleteDialog();
+        });
+    }
+
     document.querySelectorAll(".auto-submit").forEach(function (input) {
         input.addEventListener("change", function () {
             if (input.form) {

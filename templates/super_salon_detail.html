@@ -130,4 +130,40 @@
         </table>
     </div>
 </section>
+
+{% if current_user and current_user.role == 'super_admin' %}
+<section class="panel danger-zone">
+    <div>
+        <h2>Opasna zona</h2>
+        <p>Trajno brisanje salona uklanja sve njegove korisnike, klijente, termine, usluge, radnike, rasporede i evidenciju pretplate.</p>
+    </div>
+    <button class="btn btn-danger" type="button" data-salon-delete-open>Obriši salon</button>
+</section>
+
+<dialog class="confirmation-dialog" data-salon-delete-dialog data-salon-name="{{ salon.name }}" aria-labelledby="deleteSalonTitle">
+    <div class="confirmation-step" data-delete-warning-step>
+        <span class="eyebrow danger-text">Nepovratna radnja</span>
+        <h2 id="deleteSalonTitle">Obrisati salon {{ salon.name }}?</h2>
+        <p>Ovim se trajno brišu svi podaci koji pripadaju ovom salonu, uključujući {{ counts.clients }} klijenata i {{ counts.appointments }} termina. Podaci se ne mogu vratiti.</p>
+        <div class="form-actions">
+            <button class="btn btn-ghost" type="button" data-salon-delete-cancel>Odustani</button>
+            <button class="btn btn-danger" type="button" data-salon-delete-continue>Razumem, nastavi</button>
+        </div>
+    </div>
+    <form method="post" action="{{ url_for('super_admin_delete_salon', salon_id=salon.id) }}" class="confirmation-step" data-delete-name-step hidden>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <span class="eyebrow danger-text">Druga potvrda</span>
+        <h2>Unesite naziv salona</h2>
+        <p>Za potvrdu unesite tačno <strong>{{ salon.name }}</strong>.</p>
+        <label>
+            Naziv salona
+            <input type="text" name="salon_name_confirmation" autocomplete="off" data-salon-name-input required>
+        </label>
+        <div class="form-actions">
+            <button class="btn btn-ghost" type="button" data-salon-delete-back>Nazad</button>
+            <button class="btn btn-danger" type="submit" data-salon-delete-submit disabled>Trajno obriši salon</button>
+        </div>
+    </form>
+</dialog>
+{% endif %}
 {% endblock %}

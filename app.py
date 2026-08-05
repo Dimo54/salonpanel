@@ -200,6 +200,44 @@ def db_execute_many(query, rows):
     get_db().commit()
 
 
+class SalonNotFoundError(Exception):
+    pass
+
+
+class SalonNameConfirmationError(Exception):
+    pass
+
+
+def delete_salon_tenant_data(salon_id, confirmed_name):
+    """Delete one salon and all of its tenant-owned data atomically."""
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT id, name FROM salons WHERE id = %s FOR UPDATE",
+                (salon_id,),
+            )
+            salon = cur.fetchone()
+            if not salon:
+                raise SalonNotFoundError
+            if str(salon["name"]) != str(confirmed_name or ""):
+                raise SalonNameConfirmationError
+
+            # Appointments restrict deletion of their service and worker. Remove
+            # only this salon's appointments first; email_events cascade from them.
+            cur.execute("DELETE FROM appointments WHERE salon_id = %s", (salon_id,))
+
+            # Direct salon foreign keys cascade users, clients, services, workers,
+            # time off, working hours, subscription/booking/email events. Worker
+            # foreign keys then cascade assignments, hours and breaks.
+            cur.execute("DELETE FROM salons WHERE id = %s", (salon_id,))
+        connection.commit()
+        return salon
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def local_now():
     try:
         return datetime.now(ZoneInfo(APP_TIMEZONE))
@@ -4130,6 +4168,25 @@ def super_admin_update_subscription(salon_id):
         raise
     flash("Pretplata je azurirana.", "success")
     return redirect(url_for("super_admin_salon_detail", salon_id=salon_id))
+
+
+@app.route("/super-admin/salons/<int:salon_id>/delete", methods=["POST"])
+@super_admin_required
+def super_admin_delete_salon(salon_id):
+    confirmed_name = request.form.get("salon_name_confirmation", "")
+    try:
+        salon = delete_salon_tenant_data(salon_id, confirmed_name)
+    except SalonNotFoundError:
+        flash("Salon nije pronađen.", "error")
+        return redirect(url_for("super_admin_salons"))
+    except SalonNameConfirmationError:
+        flash("Naziv salona nije tačno unet. Salon nije obrisan.", "error")
+        return redirect(url_for("super_admin_salon_detail", salon_id=salon_id))
+
+    if session.get("impersonate_salon_id") == salon_id:
+        session.pop("impersonate_salon_id", None)
+    flash(f"Salon {salon['name']} i svi njegovi podaci su trajno obrisani.", "success")
+    return redirect(url_for("super_admin_salons"))
 
 
 @app.route("/super-admin/salons/<int:salon_id>/impersonate", methods=["POST"])
