@@ -88,7 +88,7 @@ Podrazumevane cene su:
 - godišnji plan: `199.99 EUR`;
 - probni period: `7 dana`.
 
-Online naplata još nije povezana. Status pretplate se i dalje može menjati ručno iz super admin panela.
+Mesečna i godišnja kupovina otvaraju Paddle Billing checkout. Potpisani webhook događaji autoritativno sinhronizuju lokalni status, a Paddle Customer Portal omogućava prijavljenom salonu da upravlja naplatom. Neaktivni nalozi se centralno preusmeravaju na stranicu pretplate; javno zakazivanje i operativni webhook pozivi ostaju dostupni.
 
 ## Da li je domen potreban?
 
@@ -140,6 +140,30 @@ YEARLY_PRICE_EUR=199.99
 
 Ove vrednosti postoje kao Environment promenljive da bi cena kasnije mogla da se promeni bez menjanja više delova koda.
 
+### Paddle Billing
+
+```text
+PADDLE_ENVIRONMENT=sandbox
+PADDLE_CLIENT_TOKEN=test_...
+PADDLE_API_KEY=pdl_sdbx_apikey_...
+PADDLE_MONTHLY_PRICE_ID=pri_...
+PADDLE_YEARLY_PRICE_ID=pri_...
+PADDLE_WEBHOOK_SECRET=pdl_ntfset_...
+PADDLE_WEBHOOK_TOLERANCE_SECONDS=5
+SUBSCRIPTION_GRACE_DAYS=7
+```
+
+- `PADDLE_ENVIRONMENT` mora biti `sandbox` ili `production`.
+- `PADDLE_CLIENT_TOKEN` i ID-jevi cena prosleđuju se Paddle.js stranici za checkout.
+- `PADDLE_API_KEY` ostaje isključivo na serveru i koristi se za proveru trenutnog stanja pretplate preko Paddle API-ja pre izmene salona.
+- `PADDLE_WEBHOOK_SECRET` je tajna notification destination-a iz Paddle kontrolne table. Ona je različita od API ključa i koristi se za proveru `Paddle-Signature` zaglavlja na `/webhooks/paddle`.
+- `PADDLE_WEBHOOK_TOLERANCE_SECONDS` određuje dozvoljeno odstupanje vremena potpisa i podrazumevano je `5` sekundi.
+- `SUBSCRIPTION_GRACE_DAYS` određuje jednokratni rok posle prvog `past_due` statusa. Podrazumevano je `7`; neispravna, negativna ili nerazumno velika vrednost bezbedno se vraća na `7`.
+
+Webhook proverava potpis, idempotentno čuva podržane događaje i sinhronizuje salon isključivo iz autoritativne Paddle pretplate. Nepodržani događaji se beleže i ignorišu. API ključ mora imati Paddle dozvole `subscription.read` i `customer_portal_session.write`.
+
+Detaljan redosled sandbox i produkcionog puštanja nalazi se u `docs/PADDLE_ROLLOUT.md`.
+
 ### Brevo email
 
 ```text
@@ -157,10 +181,10 @@ Aplikacija će raditi i bez ovih promenljivih, ali emailovi neće biti poslati.
 ### Automatski podsetnici
 
 ```text
-CRON_SECRET=druga_duga_nasumicna_vrednost
+REMINDER_SECRET=druga_duga_nasumicna_vrednost
 ```
 
-`CRON_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu mora da koristi `POST` i pošalje tajnu samo kroz zaglavlje `Authorization: Bearer ...`.
+`REMINDER_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu mora da koristi `POST` i pošalje tajnu samo kroz zaglavlje `Authorization: Bearer ...`. Stari naziv `CRON_SECRET` privremeno ostaje podržan samo radi bezbedne rotacije; nova okruženja treba da koriste `REMINDER_SECRET`.
 
 ### Opciona zaštita prijave
 
@@ -192,6 +216,16 @@ Testovi ne pokreću inicijalizaciju baze i ne zahtevaju vezu sa Supabase projekt
 SALONPANEL_SKIP_DB_INIT=1 SECRET_KEY=test-secret-key DATABASE_URL=postgresql://test:test@localhost/test \
 python -m unittest discover -s tests -v
 ```
+
+Paddle migracije se pre nove verzije izvršavaju redom:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_paddle_event_id.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_paddle_subscription_updated_at.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_subscription_grace_ends_at.sql
+```
+
+Za kontrolisano izvršavanje koristi `scripts/run_paddle_migrations.py`; podrazumevani režim je samo dry-run. Kompletan redosled validacije, sandbox provere, rezervne kopije, smoke testa i rollback-a nalazi se u [Paddle rollout vodiču](docs/PADDLE_ROLLOUT.md).
 
 ## Render podešavanja
 
@@ -243,7 +277,7 @@ Aplikacija automatski dodaje `sslmode=require` ako ga nema.
 
 ## Važna ograničenja ove verzije
 
-- Paddle naplata još nije povezana.
+- Paddle proizvodi, cene, API ključ, customer portal i webhook destination moraju se posebno podesiti u Paddle kontrolnoj tabli.
 - Podsetnici ne mogu da se šalju sami dok se ne podesi satni cron poziv.
 - Politika privatnosti i Uslovi korišćenja su nacrti.
 - Pre puštanja većeg broja salona treba napraviti i proveriti strategiju rezervnih kopija Supabase baze.

@@ -693,6 +693,18 @@ class SecurityTests(unittest.TestCase):
         db_query.assert_called_once()
         send_event.assert_not_called()
 
+    def test_reminder_secret_is_primary_with_legacy_cron_fallback(self):
+        secret = "reminder-test-secret"
+        with (
+            patch.dict(salon_app.os.environ, {"REMINDER_SECRET": secret, "CRON_SECRET": "legacy-secret"}),
+            patch.object(salon_app, "db_query", return_value=[]),
+        ):
+            response = self.client.post(
+                "/tasks/send-reminders",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+        self.assertEqual(response.status_code, 200)
+
     def test_csv_safe_value_neutralizes_formula_prefixes(self):
         for prefix in ("=", "+", "-", "@"):
             with self.subTest(prefix=prefix):
