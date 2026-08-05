@@ -1396,7 +1396,7 @@ input[readonly] {
 
 .booking-shell-wide {
     width: min(1320px, calc(100% - 32px));
-    grid-template-columns: minmax(300px, 0.78fr) minmax(560px, 1.32fr);
+    grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
     align-items: start;
     padding-top: 70px;
 }
@@ -2559,6 +2559,24 @@ input[readonly] {
 .consent-row input {
     margin-top: 2px;
     flex: 0 0 auto;
+}
+
+.booking-form .consent-row {
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr);
+    min-width: 0;
+}
+
+.booking-form .consent-row input {
+    width: 18px;
+    height: 18px;
+    min-height: 18px;
+    padding: 0;
+}
+
+.booking-form .consent-row span {
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .auth-links {
