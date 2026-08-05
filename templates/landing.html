@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="sr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    {% set seo_indexable = true %}
+    {% set seo_robots = "index, follow" %}
+    {% set seo_title = "SalonPanel | Online zakazivanje i upravljanje salonima" %}
+    {% set seo_description = "SalonPanel objedinjuje online zakazivanje, termine, kalendar, klijente, radnike, usluge i cene u jednoj aplikaciji za salone." %}
+    {% set seo_canonical_url = "https://salonpanel.app/" %}
+    <title>{{ seo_title }}</title>
+    {% include "_seo_meta.html" %}
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body class="landing-body">
+    <a class="skip-link" href="#glavni-sadrzaj">Preskoči na glavni sadržaj</a>
+    <div class="landing-glow" aria-hidden="true"></div>
+
+    <header class="landing-header">
+        <a class="brand landing-brand" href="{{ url_for('home') }}" aria-label="SalonPanel početna">
+            <span class="brand-mark">SP</span>
+            <span><strong>SalonPanel</strong><small>Upravljanje salonima</small></span>
+        </a>
+        <nav class="landing-nav" aria-label="Glavna navigacija">
+            <a href="#mogucnosti">Mogućnosti</a>
+            <a href="#kako-radi">Kako radi</a>
+            <a href="#prednosti">Prednosti</a>
+            <a href="{{ url_for('login') }}">Prijava</a>
+            <a class="btn btn-primary" href="{{ url_for('register') }}">Registrujte salon</a>
+        </nav>
+    </header>
+
+    <main id="glavni-sadrzaj">
+        <section class="landing-hero" aria-labelledby="hero-title">
+            <div class="landing-hero-copy">
+                <div class="hero-kicker"><span></span> Online zakazivanje i upravljanje salonima</div>
+                <h1 id="hero-title">Salon pod kontrolom. <span>Svaki termin na svom mestu.</span></h1>
+                <p>SalonPanel spaja javno online zakazivanje sa kalendarom, klijentima, radnicima, uslugama i cenama — da vaš tim ima jasan pregled radnog dana.</p>
+                <div class="landing-actions hero-actions">
+                    <a class="btn btn-primary landing-primary-action" href="{{ url_for('register') }}">
+                        Registrujte salon
+                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>
+                    </a>
+                    <a class="btn landing-secondary-action" href="{{ url_for('login') }}">Prijavite se</a>
+                </div>
+                <ul class="landing-points" aria-label="Ključne mogućnosti">
+                    <li>Javni link za zakazivanje</li>
+                    <li>Ručna ili automatska potvrda</li>
+                    <li>Odvojen nalog svakog salona</li>
+                </ul>
+            </div>
+
+            <div class="product-window hero-product-window" role="img" aria-label="Fiktivni prikaz SalonPanel kontrolne table sa rasporedom termina">
+                <div class="window-bar">
+                    <div class="window-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <span class="window-title">SalonPanel · Demo prikaz</span>
+                    <span class="window-live"><i></i> Ažurno</span>
+                </div>
+                <div class="dashboard-shell">
+                    <aside class="mock-sidebar" aria-hidden="true">
+                        <div class="mock-logo">SP</div>
+                        <span class="mock-nav active"></span><span class="mock-nav"></span><span class="mock-nav"></span><span class="mock-nav"></span><span class="mock-nav"></span>
+                    </aside>
+                    <div class="mock-dashboard">
+                        <div class="mock-dashboard-head">
+                            <div><small>Ponedeljak</small><strong>Današnji raspored</strong></div>
+                            <span class="mock-add">+ Novi termin</span>
+                        </div>
+                        <div class="mock-metrics">
+                            <div><small>Termini danas</small><strong>8</strong><span>6 potvrđeno</span></div>
+                            <div><small>Na čekanju</small><strong>2</strong><span>za pregled</span></div>
+                            <div><small>Aktivni radnici</small><strong>3</strong><span>u rasporedu</span></div>
+                        </div>
+                        <div class="mock-schedule">
+                            <div class="schedule-scale" aria-hidden="true"><span>09:00</span><span>10:00</span><span>11:00</span><span>12:00</span></div>
+                            <div class="schedule-column">
+                                <div class="schedule-person"><span>AM</span><strong>Ana M.</strong></div>
+                                <div class="appointment-block purple"><small>09:30 · 45 min</small><strong>Šišanje i feniranje</strong><span>Potvrđeno</span></div>
+                            </div>
+                            <div class="schedule-column">
+                                <div class="schedule-person"><span>MJ</span><strong>Milica J.</strong></div>
+                                <div class="appointment-block cyan"><small>10:00 · 30 min</small><strong>Muško šišanje</strong><span>Potvrđeno</span></div>
+                                <div class="appointment-block amber"><small>11:15 · 45 min</small><strong>Feniranje</strong><span>Na čekanju</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="trust-strip" aria-labelledby="trust-title">
+            <div class="trust-intro">
+                <span class="eyebrow">Napravljeno za salone</span>
+                <h2 id="trust-title">Manje prekidanja. Više jasnoće u rasporedu.</h2>
+            </div>
+            <div class="trust-grid">
+                <article>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V8l8-4 8 4v11M8 19v-6h8v6M3 19h18"/></svg>
+                    <div><h3>Za timove koji rade sa terminima</h3><p>Frizerski, beauty i barber saloni dobijaju jedno mesto za svakodnevnu organizaciju.</p></div>
+                </article>
+                <article>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 2v4m8-4v4M4 9h16M5 4h14a1 1 0 0 1 1 1v15H4V5a1 1 0 0 1 1-1Z"/><path d="m9 15 2 2 4-5"/></svg>
+                    <div><h3>Raspored koji je lako pratiti</h3><p>Termini, statusi, radnici i dostupnost povezani su u pregledan kalendar.</p></div>
+                </article>
+                <article>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 11h10M7 15h6M5 3h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H9l-5 3v-5a2 2 0 0 1-1-2V5a2 2 0 0 1 2-2Z"/></svg>
+                    <div><h3>Zakazivanje bez stalnih poziva</h3><p>Klijent preko javnog linka bira ponuđenu uslugu, radnika i slobodan termin.</p></div>
+                </article>
+            </div>
+        </section>
+
+        <section class="landing-section features-section" id="mogucnosti" aria-labelledby="features-title">
+            <div class="landing-section-head centered-head">
+                <span class="eyebrow">Sve povezano</span>
+                <h2 id="features-title">Jedan uredan sistem za ceo radni dan.</h2>
+                <p>Od prvog zahteva za termin do završene usluge, informacije ostaju organizovane i dostupne timu salona.</p>
+            </div>
+            <div class="landing-feature-grid premium-feature-grid">
+                <article class="landing-feature feature-wide feature-accent-purple">
+                    <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 2v4m8-4v4M4 9h16M5 4h14a1 1 0 0 1 1 1v15H4V5a1 1 0 0 1 1-1Z"/><path d="m9 15 2 2 4-5"/></svg></div>
+                    <div><h3>Online zakazivanje</h3><p>Javni link salona vodi klijenta kroz izbor usluge, radnika, datuma i dostupnog vremena.</p></div>
+                    <div class="mini-booking-ui" aria-hidden="true">
+                        <span class="mini-label">Izaberite termin</span>
+                        <div class="mini-days"><i>Pon<small>12</small></i><i class="selected">Uto<small>13</small></i><i>Sre<small>14</small></i><i>Čet<small>15</small></i></div>
+                        <div class="mini-times"><i>09:00</i><i>10:30</i><i class="selected">12:00</i><i>14:30</i></div>
+                    </div>
+                </article>
+                <article class="landing-feature">
+                    <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v15H4zM8 2v6m8-6v6M4 10h16"/></svg></div>
+                    <h3>Termini i kalendar</h3>
+                    <p>Pregledajte raspored po datumu, filtrirajte termine i pratite njihov trenutni status.</p>
+                </article>
+                <article class="landing-feature">
+                    <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0m2-9v6m-3-3h6"/></svg></div>
+                    <h3>Radnici i dostupnost</h3>
+                    <p>Podesite radno vreme, pauze, odsustva i usluge za svakog člana tima.</p>
+                </article>
+                <article class="landing-feature">
+                    <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13 11 22l-9-9V4a2 2 0 0 1 2-2h9l7 7a3 3 0 0 1 0 4Z"/><circle cx="7.5" cy="7.5" r="1.5"/></svg></div>
+                    <h3>Usluge i cene</h3>
+                    <p>Vodite ponudu, trajanje i cenu usluge, uključujući podešavanja po radniku.</p>
+                </article>
+                <article class="landing-feature">
+                    <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></div>
+                    <h3>Evidencija klijenata</h3>
+                    <p>Kontakt podaci i istorija termina ostaju u okviru odvojenog naloga salona.</p>
+                </article>
+                <article class="landing-feature feature-wide feature-accent-cyan">
+                    <div class="feature-copy">
+                        <div class="feature-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3z"/><path d="m3 6 9 7 9-7"/></svg></div>
+                        <h3>Email obaveštenja</h3>
+                        <p>Aplikacija podržava poruke povezane sa prijemom zahteva, potvrdom, izmenom i otkazivanjem termina.</p>
+                    </div>
+                    <div class="mail-stack" aria-hidden="true">
+                        <div><span class="mail-mark purple">✓</span><p><strong>Termin je potvrđen</strong><small>Potvrda za izabrani termin</small></p><em>Sada</em></div>
+                        <div><span class="mail-mark cyan">↗</span><p><strong>Primljen je zahtev</strong><small>Salon može da pregleda zahtev</small></p><em>09:42</em></div>
+                    </div>
+                </article>
+            </div>
+        </section>
+
+        <section class="landing-section workflow-section" id="kako-radi" aria-labelledby="workflow-title">
+            <div class="landing-section-head">
+                <span class="eyebrow">Kako radi</span>
+                <h2 id="workflow-title">Od podešavanja do uređenog kalendara.</h2>
+                <p>Jasan tok povezuje salon, klijenta i raspored bez suvišnih koraka.</p>
+            </div>
+            <ol class="workflow-track">
+                <li><span class="workflow-number">01</span><div><h3>Podesite salon</h3><p>Unesite usluge, cene, radnike i radno vreme.</p></div></li>
+                <li><span class="workflow-number">02</span><div><h3>Podelite javni link</h3><p>Klijenti dobijaju pristup stranici za online zakazivanje.</p></div></li>
+                <li><span class="workflow-number">03</span><div><h3>Klijent bira termin</h3><p>Bira uslugu, radnika, datum i ponuđeno slobodno vreme.</p></div></li>
+                <li><span class="workflow-number">04</span><div><h3>Potvrdite na svoj način</h3><p>Koristite ručnu potvrdu zahteva ili automatsko zakazivanje.</p></div></li>
+                <li><span class="workflow-number">05</span><div><h3>Vodite raspored</h3><p>Pratite statuse i upravljajte terminima iz panela i kalendara.</p></div></li>
+            </ol>
+        </section>
+
+        <section class="landing-section product-story" aria-labelledby="preview-title">
+            <div class="product-story-copy">
+                <span class="eyebrow">Pregled bez traženja</span>
+                <h2 id="preview-title">Tim, raspored i dostupnost na istom ekranu.</h2>
+                <p>SalonPanel povezuje radno vreme, pauze, odsustva i dodeljene usluge, pa se dostupnost radnika oslanja na podešavanja salona.</p>
+                <ul class="benefit-checks">
+                    <li><span>✓</span> Radno vreme po danima</li>
+                    <li><span>✓</span> Pauze i odsustva radnika</li>
+                    <li><span>✓</span> Usluge, trajanje i cene po radniku</li>
+                </ul>
+            </div>
+            <div class="product-window team-product-window" role="img" aria-label="Fiktivni prikaz upravljanja radnicima i njihovom dostupnošću">
+                <div class="window-bar">
+                    <div class="window-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+                    <span class="window-title">Tim i dostupnost · Demo prikaz</span>
+                </div>
+                <div class="team-ui">
+                    <div class="team-ui-head"><div><small>Radnici</small><strong>Raspored tima</strong></div><span>+ Dodaj radnika</span></div>
+                    <div class="team-tabs"><span class="active">Svi radnici</span><span>Radno vreme</span><span>Odsustva</span></div>
+                    <div class="team-card-row">
+                        <div class="team-avatar purple">AM</div>
+                        <div class="team-person"><strong>Ana M.</strong><small>3 aktivne usluge</small></div>
+                        <div class="team-hours"><span>Pon–Pet</span><strong>09:00–17:00</strong></div>
+                        <span class="team-badge">Aktivna</span>
+                    </div>
+                    <div class="team-card-row">
+                        <div class="team-avatar cyan">MJ</div>
+                        <div class="team-person"><strong>Milica J.</strong><small>4 aktivne usluge</small></div>
+                        <div class="team-hours"><span>Uto–Sub</span><strong>10:00–18:00</strong></div>
+                        <span class="team-badge">Aktivna</span>
+                    </div>
+                    <div class="team-card-row muted-row">
+                        <div class="team-avatar slate">NP</div>
+                        <div class="team-person"><strong>Nina P.</strong><small>Odsustvo danas</small></div>
+                        <div class="team-hours"><span>Povratak</span><strong>Sutra</strong></div>
+                        <span class="team-badge away">Odsutna</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="landing-section benefits-section" id="prednosti" aria-labelledby="benefits-title">
+            <div class="landing-section-head centered-head">
+                <span class="eyebrow">Svakodnevne prednosti</span>
+                <h2 id="benefits-title">Više reda, manje ručne administracije.</h2>
+                <p>SalonPanel uklanja nepotrebno prepisivanje informacija i daje timu zajednički pregled rada.</p>
+            </div>
+            <div class="benefits-grid">
+                <article><strong>01</strong><h3>Manje poziva oko termina</h3><p>Javni link omogućava klijentu da sam izabere među ponuđenim slobodnim vremenima.</p></article>
+                <article><strong>02</strong><h3>Organizovan kalendar</h3><p>Termini i statusi su prikazani po datumu i radniku, bez paralelnih beleški.</p></article>
+                <article><strong>03</strong><h3>Lakše upravljanje timom</h3><p>Radno vreme, pauze, odsustva i usluge svakog radnika ostaju povezani.</p></article>
+                <article><strong>04</strong><h3>Bolji pregled dana</h3><p>Salon na jednom mestu vidi šta je zakazano, šta čeka potvrdu i ko je dostupan.</p></article>
+            </div>
+        </section>
+
+        <section class="landing-cta" aria-labelledby="cta-title">
+            <div class="cta-glow" aria-hidden="true"></div>
+            <div class="cta-copy">
+                <span class="eyebrow">Sledeći korak</span>
+                <h2 id="cta-title">Dajte svom salonu jasniji način rada.</h2>
+                <p>Kreirajte SalonPanel nalog i podesite usluge, tim i online zakazivanje na jednom mestu.</p>
+            </div>
+            <div class="cta-actions">
+                <a class="btn btn-primary landing-primary-action" href="{{ url_for('register') }}">
+                    Registrujte salon
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5"/></svg>
+                </a>
+                <span>Već imate nalog? <a href="{{ url_for('login') }}">Prijavite se</a></span>
+            </div>
+        </section>
+    </main>
+
+    <footer class="landing-footer">
+        <div class="footer-main">
+            <div class="brand landing-brand">
+                <span class="brand-mark">SP</span>
+                <span><strong>SalonPanel</strong><small>Online zakazivanje i upravljanje salonima</small></span>
+            </div>
+            <p>Termini, kalendar, klijenti, radnici i usluge u jednoj aplikaciji za salone.</p>
+        </div>
+        <div class="footer-links">
+            <span>Proizvod</span>
+            <a href="#mogucnosti">Mogućnosti</a>
+            <a href="#kako-radi">Kako radi</a>
+            <a href="{{ url_for('login') }}">Prijava</a>
+        </div>
+        <div class="footer-links">
+            <span>Pravne informacije</span>
+            <a href="{{ url_for('privacy_policy') }}">Politika privatnosti</a>
+            <a href="{{ url_for('terms_of_service') }}">Uslovi korišćenja</a>
+        </div>
+    </footer>
+</body>
+</html>

@@ -39,6 +39,8 @@ from email_service import (
 from phone_utils import normalize_phone
 
 APP_NAME = "SalonPanel"
+PRODUCTION_BASE_URL = "https://salonpanel.app"
+PUBLIC_NOINDEX_FOLLOW_ENDPOINTS = frozenset({"privacy_policy", "terms_of_service"})
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
 MONTHLY_PRICE_EUR = float(os.environ.get("MONTHLY_PRICE_EUR", "19.99"))
 YEARLY_PRICE_EUR = float(os.environ.get("YEARLY_PRICE_EUR", "199.99"))
@@ -948,6 +950,13 @@ def add_security_headers(response):
     )
     if request.is_secure:
         response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if request.endpoint in PUBLIC_NOINDEX_FOLLOW_ENDPOINTS and response.status_code == 200:
+        response.headers.setdefault("X-Robots-Tag", "noindex, follow")
+    elif not (
+        (request.endpoint == "home" and response.status_code == 200)
+        or request.endpoint in {"robots_txt", "sitemap_xml", "static"}
+    ):
+        response.headers.setdefault("X-Robots-Tag", "noindex, nofollow")
     if session.get("user_id") or request.endpoint in {
         "public_booking", "booking_success", "login", "register", "forgot_password", "reset_password"
     }:
@@ -1935,7 +1944,54 @@ def home():
         return redirect(url_for("super_admin_dashboard"))
     if user:
         return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
+    return render_template("landing.html")
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    content = """User-agent: *
+Allow: /privacy
+Allow: /terms
+Allow: /static/
+Disallow: /login
+Disallow: /register
+Disallow: /verify-email/
+Disallow: /resend-verification
+Disallow: /forgot-password
+Disallow: /reset-password/
+Disallow: /logout
+Disallow: /dashboard
+Disallow: /appointments
+Disallow: /clients
+Disallow: /workers
+Disallow: /calendar
+Disallow: /availability
+Disallow: /services
+Disallow: /settings
+Disallow: /subscription
+Disallow: /super-admin
+Disallow: /export/
+Disallow: /tasks/
+Disallow: /api/
+Disallow: /s/
+Disallow: /zakazi
+
+Sitemap: https://salonpanel.app/sitemap.xml
+"""
+    return Response(content, content_type="text/plain; charset=utf-8")
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    urls = (f"{PRODUCTION_BASE_URL}/",)
+    entries = "".join(f"  <url><loc>{url}</loc></url>\n" for url in urls)
+    content = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{entries}"
+        "</urlset>\n"
+    )
+    return Response(content, content_type="application/xml; charset=utf-8")
 
 
 @app.route("/login", methods=["GET", "POST"])
