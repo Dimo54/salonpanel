@@ -58,7 +58,7 @@
             </div>
             <a href="{{ url_for('appointments') }}">Svi termini</a>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap" role="region" aria-label="Naredni termini" tabindex="0">
             <table>
                 <thead>
                     <tr>
@@ -94,10 +94,10 @@
     <section class="panel accent-panel">
         <h2>Javno zakazivanje</h2>
         <p>Ovaj link salon salje klijentima. Svaki salon ima svoj odvojeni link i svoje termine.</p>
-        <div class="mini-list">
-            <div><span>Link za zakazivanje</span><strong>{{ url_for('public_booking', slug=current_salon.slug, _external=True) }}</strong></div>
+        <div class="mini-list dashboard-details">
+            <div><span>Link za zakazivanje</span><strong class="public-booking-url">{{ url_for('public_booking', slug=current_salon.slug, _external=True) }}</strong></div>
             <div><span>Status pretplate</span><strong>{{ current_salon.subscription_status|subscription_label }} / {{ plan_labels.get(current_salon.subscription_plan, current_salon.subscription_plan) }}</strong></div>
-            <div><span>Radno vreme</span><strong>{{ settings.working_hours }}</strong></div>
+            <div><span>Radno vreme</span><strong class="working-hours-text">{{ settings.working_hours }}</strong></div>
         </div>
     </section>
 </div>
