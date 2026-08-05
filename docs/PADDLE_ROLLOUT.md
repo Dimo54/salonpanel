@@ -1,137 +1,114 @@
-# Paddle rollout
+# Paddle rollout control document
 
-## Feature overview
+This document is the single entry point for Paddle sandbox acceptance and the later production release. It does not authorize a deployment, payment, dashboard change, or production database operation.
 
-SalonPanel provides a seven-day local trial, Paddle.js checkout, signed and idempotent subscription webhooks, central application access control, a persisted past-due grace deadline, a local subscription status page, and server-created Paddle Customer Portal sessions. Page loads never call Paddle; Paddle is queried only while processing a signed supported webhook or creating a portal session.
+## Release invariants
 
-## Local states and access
+- Review and deploy one immutable commit. Never mix sandbox and live Paddle entities.
+- Back up and verify PostgreSQL before production migrations.
+- Apply only the three additive migrations through the repository runner.
+- Paddle webhooks are authoritative. Never repair billing state by replaying an event until ordering and idempotency have been reviewed.
+- Application rollback normally leaves the additive nullable columns and unique event index in place.
+- Never paste credentials, cookies, Paddle portal URLs, authorization headers, customer data, or webhook bodies into logs, tickets, screenshots, or chat.
 
-Authoritative Paddle statuses map as follows:
+Related procedures:
 
-| Paddle | Local | Access |
+- [Sandbox lifecycle and smoke test](SANDBOX_SMOKE_TEST.md)
+- [Render deployment runbook](DEPLOYMENT_RUNBOOK.md)
+- [Rollback runbook](ROLLBACK_RUNBOOK.md)
+- [PR preparation](PR_PREPARATION.md)
+
+## Required environment variable names
+
+The rollout validator treats every name below as required. It reports only `present`, `missing`, or `malformed`; it never reports any part of a value.
+
+```text
+DATABASE_URL
+SECRET_KEY
+BREVO_API_KEY
+BREVO_SENDER_EMAIL
+REMINDER_SECRET
+PADDLE_ENVIRONMENT
+PADDLE_CLIENT_TOKEN
+PADDLE_API_KEY
+PADDLE_MONTHLY_PRICE_ID
+PADDLE_YEARLY_PRICE_ID
+PADDLE_WEBHOOK_SECRET
+PADDLE_WEBHOOK_TOLERANCE_SECONDS
+SUBSCRIPTION_GRACE_DAYS
+```
+
+`PADDLE_ENVIRONMENT` must exactly match the validator mode (`sandbox` or `production`). `PADDLE_WEBHOOK_TOLERANCE_SECONDS` must be a nonnegative integer, matching the application parser. `SUBSCRIPTION_GRACE_DAYS` must be an integer from 0 through 365. The validator checks PostgreSQL URL structure and sender email syntax. It deliberately checks Paddle tokens, API keys, prices, and secrets only for presence: rejecting future valid values based on guessed formats would be unsafe. Paddle documents client-side tokens as browser-safe and API keys/webhook secrets as server-only credentials.
+
+The application uses `REMINDER_SECRET`. `CRON_SECRET` is a temporary compatibility fallback for existing installations and is not accepted as satisfying rollout validation.
+
+```bash
+.venv/bin/python scripts/validate_environment.py --mode sandbox
+.venv/bin/python scripts/validate_environment.py --mode production
+```
+
+## Migration contract
+
+The only Paddle rollout migrations, in immutable order, are:
+
+1. `20260805_add_paddle_event_id.sql`
+2. `20260805_add_paddle_subscription_updated_at.sql`
+3. `20260805_add_subscription_grace_ends_at.sql`
+
+They add columns/indexes with `IF NOT EXISTS`; no down migration is part of this rollout. The runner requires `DATABASE_URL`, never displays it, uses `psql -X` and `ON_ERROR_STOP`, and suppresses database diagnostics that could contain connection details.
+
+```bash
+# Validate filenames/order only; no connection is made.
+DATABASE_URL='set-outside-shell-history' .venv/bin/python scripts/run_paddle_migrations.py
+
+# Read-only schema check.
+DATABASE_URL='set-outside-shell-history' .venv/bin/python scripts/run_paddle_migrations.py --check --environment sandbox
+
+# Sandbox apply.
+DATABASE_URL='set-outside-shell-history' .venv/bin/python scripts/run_paddle_migrations.py --apply --environment sandbox
+
+# Production apply requires both flags and must be run only in the approved window.
+DATABASE_URL='set-outside-shell-history' .venv/bin/python scripts/run_paddle_migrations.py \
+  --apply --environment production --confirm-production APPLY-PADDLE-MIGRATIONS
+```
+
+Prefer exporting `DATABASE_URL` from a protected operator environment instead of placing it literally in shell history. The placeholders above are not credentials.
+
+## Automated release gate
+
+From a clean checkout of the reviewed branch:
+
+```bash
+scripts/validate_release.sh
+```
+
+The command checks branch `paddle-integration` (override only with `--expected-branch BRANCH`), a clean tree, commit SHA, migrations, documented environment names, Paddle tests, subscription access tests, the full unit suite, `git diff --check`, and Python compilation. It performs no network request and no database write.
+
+## Current application/deployment facts
+
+- Build command documented by this repository: `pip install -r requirements.txt`
+- Start command: `gunicorn app:app`
+- No `render.yaml`, Dockerfile, Procfile, deployment automation, or repository-defined Render policy exists.
+- No health/readiness route is currently implemented. Do not configure a guessed Render health path; use startup logs and the non-destructive public smoke suite unless a separately reviewed health route is added.
+- PostgreSQL schema initialization still runs at process start unless `SALONPANEL_SKIP_DB_INIT=1`; the explicit migration runner remains the controlled rollout step.
+- Existing test convention is Python `unittest` with DB initialization disabled and a non-live placeholder `DATABASE_URL`.
+
+## Authoritative state expectations
+
+| Paddle state | Local state | Protected access |
 |---|---|---|
-| `active` | `active` | allowed |
-| `trialing` | `active` | allowed |
-| `past_due` | `past_due` | through the persisted grace deadline, inclusive |
+| `active` or `trialing` | `active` | allowed |
+| `past_due` | `past_due` | allowed through persisted deadline, inclusive |
 | `paused` | `blocked` | denied |
 | `canceled` | `cancelled` | denied |
-| other/missing | `blocked` | denied |
+| missing/unknown | `blocked` | denied |
 
-Local `trial` access requires a valid `trial_ends_at` on or after the current local date. Missing, malformed, or expired dates deny access. Unknown, empty, null, `blocked`, and `cancelled` states deny access. Super administrators, including while impersonating, retain access.
+The first authoritative `past_due` transition persists the grace deadline. Repeated `past_due` events must not extend it. Active, blocked, paused, canceled, and unknown states clear it. Public booking, reminder authentication, webhook processing, and subscription recovery remain gate-exempt.
 
-Registration persists a seven-day trial. On the first authoritative transition to `past_due`, the webhook persists `subscription_grace_ends_at = authoritative updated_at + SUBSCRIPTION_GRACE_DAYS`. Subsequent `past_due` updates preserve an existing deadline. Active, blocked, paused, canceled, and unknown states clear it. If `updated_at` is invalid, the signed event's valid `occurred_at` is the deterministic fallback; if both are invalid, processing rolls back and grants no access.
+## Official references
 
-## Configuration
-
-Required for Paddle:
-
-```text
-PADDLE_ENVIRONMENT=sandbox|production
-PADDLE_CLIENT_TOKEN=...
-PADDLE_API_KEY=...
-PADDLE_MONTHLY_PRICE_ID=pri_...
-PADDLE_YEARLY_PRICE_ID=pri_...
-PADDLE_WEBHOOK_SECRET=...
-```
-
-Optional safe defaults:
-
-```text
-PADDLE_WEBHOOK_TOLERANCE_SECONDS=5
-SUBSCRIPTION_GRACE_DAYS=7
-```
-
-`SUBSCRIPTION_GRACE_DAYS` accepts integers from 0 through 365; malformed, empty, negative, or larger values fall back to 7. Never expose `PADDLE_API_KEY` or `PADDLE_WEBHOOK_SECRET` to Paddle.js or templates.
-
-The Paddle API key requires exactly these application permissions:
-
-- `subscription.read` for authoritative `GET /subscriptions/{subscription_id}` reads.
-- `customer_portal_session.write` for `POST /customers/{customer_id}/portal-sessions`.
-
-Enable these webhook events on the notification destination:
-
-- `subscription.created`
-- `subscription.updated`
-- `subscription.canceled`
-
-## Sandbox checklist
-
-1. Create sandbox monthly and yearly recurring prices and record their `pri_...` IDs.
-2. Create a sandbox client-side token and an API key with `subscription.read` and `customer_portal_session.write`.
-3. Configure the sandbox customer portal actions required for the seller account.
-4. Create a notification destination pointing to `https://YOUR-HOST/webhooks/paddle` and enable the three subscription events.
-5. Put the destination secret in `PADDLE_WEBHOOK_SECRET`; it is not the API key.
-6. Set `PADDLE_ENVIRONMENT=sandbox` and all required variables in the application environment.
-7. Apply migrations, deploy to a non-production environment, and run the manual lifecycle below.
-
-## Production checklist
-
-1. Recreate products/prices, client token, API key, portal configuration, and notification destination in live Paddle; sandbox entities do not transfer.
-2. Set `PADDLE_ENVIRONMENT=production` and use only live IDs and credentials.
-3. Confirm the public HTTPS webhook URL and selected events.
-4. Back up PostgreSQL and apply the additive migrations before starting the new application version.
-5. Deploy one application version with the synchronized schema and configuration.
-6. Run a low-risk live checkout and verify webhook processing before onboarding more salons.
-
-## Database migration order
-
-Back up the database, then run from the repository root:
-
-```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_paddle_event_id.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_paddle_subscription_updated_at.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_subscription_grace_ends_at.sql
-```
-
-All three are additive and idempotent. The application fresh-install schema contains the same columns and unique event index.
-
-## Verification commands
-
-```bash
-.venv/bin/python -m unittest tests.test_paddle -v
-.venv/bin/python -m unittest tests.test_subscription_access -v
-.venv/bin/python -m unittest discover -s tests -v
-git diff --check
-.venv/bin/python -m compileall -q app.py
-```
-
-## Manual sandbox lifecycle
-
-1. Register a new salon and confirm a seven-day local trial and protected application access.
-2. Open `/subscription`, select a plan, and complete sandbox checkout.
-3. Confirm `subscription.created` is accepted and the local state becomes `active` with the expected plan.
-4. Confirm protected pages work and an active account is not offered another checkout.
-5. POST the CSRF-protected portal form and confirm it opens the sandbox Paddle customer portal.
-6. Simulate `past_due`; confirm the persisted deadline is authoritative update time plus the configured days.
-7. Repeat a later `past_due` update and confirm the deadline does not move.
-8. Test once inside grace (protected access works) and once after grace (HTML redirects; JSON receives 403).
-9. Recover payment to `active`; confirm the deadline clears and protected access returns.
-10. Cancel in Paddle; confirm `subscription.canceled` maps to `cancelled`, access is denied, and the portal recovery route remains reachable.
-11. Confirm public booking, public availability, reminder task authentication, and the Paddle webhook remain operational throughout.
-
-## Render deployment checklist
-
-1. Take a verified database backup.
-2. Apply migrations in the order above using the production database connection.
-3. Add or verify all Paddle variables in Render without printing their values.
-4. Deploy the reviewed branch through the normal Render workflow; do not run migrations concurrently from multiple instances.
-5. Verify startup, landing/login, a protected request, subscription recovery, public booking, and webhook response codes.
-6. Inspect sanitized logs and perform the production smoke test.
-
-## Rollback
-
-1. Stop new deployments and restore the previous application release.
-2. Leave the additive nullable columns and event index in place; the previous release can ignore them and no destructive down migration is required.
-3. If billing access must be restored temporarily, use the existing audited super-admin subscription control according to incident procedure.
-4. Preserve webhook event rows and logs for diagnosis; do not replay events until the cause and timestamp ordering are understood.
-5. Rotate any credential that might have been exposed.
-
-## Log inspection
-
-- Confirm accepted webhook response codes, duplicate handling, ignored unsupported events, and retryable failures.
-- Confirm invalid signatures cause no Paddle API or database work.
-- Confirm there are no API keys, notification secrets, customer IDs, portal URLs/tokens, authorization headers, or full Paddle response bodies.
-- Confirm portal failures use the generic `Paddle API request failed.` message only.
-- Confirm no recurring access redirects or JSON-to-HTML redirects.
-
-Never paste API keys, webhook secrets, signed portal URLs, or authorization headers into screenshots, commits, logs, tickets, support messages, or chat.
+- Paddle: [build and test Checkout in sandbox](https://developer.paddle.com/build/checkout/build-branded-inline-checkout/)
+- Paddle: [API key permissions](https://developer.paddle.com/api-reference/about/permissions/)
+- Paddle: [notification destinations](https://developer.paddle.com/webhooks/about/notification-destinations/)
+- Paddle: [webhook signature verification](https://developer.paddle.com/webhooks/about/signature-verification/)
+- Paddle: [Customer Portal session](https://developer.paddle.com/api-reference/customer-portals/create-customer-portal-session/)

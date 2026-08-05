@@ -181,10 +181,10 @@ Aplikacija će raditi i bez ovih promenljivih, ali emailovi neće biti poslati.
 ### Automatski podsetnici
 
 ```text
-CRON_SECRET=druga_duga_nasumicna_vrednost
+REMINDER_SECRET=druga_duga_nasumicna_vrednost
 ```
 
-`CRON_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu mora da koristi `POST` i pošalje tajnu samo kroz zaglavlje `Authorization: Bearer ...`.
+`REMINDER_SECRET` štiti rutu za podsetnike da je ne bi mogao pokretati bilo ko. Servis koji poziva rutu mora da koristi `POST` i pošalje tajnu samo kroz zaglavlje `Authorization: Bearer ...`. Stari naziv `CRON_SECRET` privremeno ostaje podržan samo radi bezbedne rotacije; nova okruženja treba da koriste `REMINDER_SECRET`.
 
 ### Opciona zaštita prijave
 
@@ -224,6 +224,8 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_paddle_event_
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_paddle_subscription_updated_at.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260805_add_subscription_grace_ends_at.sql
 ```
+
+Za kontrolisano izvršavanje koristi `scripts/run_paddle_migrations.py`; podrazumevani režim je samo dry-run. Kompletan redosled validacije, sandbox provere, rezervne kopije, smoke testa i rollback-a nalazi se u [Paddle rollout vodiču](docs/PADDLE_ROLLOUT.md).
 
 ## Render podešavanja
 

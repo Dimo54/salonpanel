@@ -4347,7 +4347,12 @@ def booking_success(slug, token):
 
 @app.route("/tasks/send-reminders", methods=["POST"])
 def send_reminders_task():
-    cron_secret = os.environ.get("CRON_SECRET", "").strip()
+    # REMINDER_SECRET is the rollout name; CRON_SECRET remains a compatibility
+    # fallback so existing installations can rotate without an outage.
+    cron_secret = (
+        os.environ.get("REMINDER_SECRET", "").strip()
+        or os.environ.get("CRON_SECRET", "").strip()
+    )
     authorization = request.headers.get("Authorization", "")
     supplied = authorization[len("Bearer "):] if authorization.startswith("Bearer ") else ""
     if not cron_secret or not supplied or not secrets.compare_digest(cron_secret, supplied):
