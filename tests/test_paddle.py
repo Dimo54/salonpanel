@@ -79,11 +79,28 @@ class PaddleIntegrationTests(unittest.TestCase):
             "customer_id": "ctm_123",
             "status": "active",
             "updated_at": "2026-08-05T12:30:00Z",
-            "custom_data": {"salon_id": "3"},
+            "custom_data": {
+                "salon_id": "3",
+                "salon_binding": salon_app.paddle_salon_binding(3),
+            },
             "items": [{"price": {"id": "pri_monthly"}}],
         }
         value.update(changes)
         return value
+
+    def test_unknown_price_id_is_not_inferred_from_billing_cycle(self):
+        subscription = self.subscription(
+            items=[{"price": {"id": "pri_unknown"}}],
+            billing_cycle={"interval": "month"},
+        )
+
+        with (
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+            patch.object(salon_app, "PADDLE_YEARLY_PRICE_ID", "pri_yearly"),
+        ):
+            plan = salon_app.paddle_subscription_plan(subscription)
+
+        self.assertIsNone(plan)
 
     def test_subscription_page_exposes_only_safe_checkout_configuration(self):
         with (
@@ -95,9 +112,11 @@ class PaddleIntegrationTests(unittest.TestCase):
             patch.object(salon_app, "PADDLE_ENVIRONMENT", "sandbox"),
             patch.object(salon_app, "PADDLE_CLIENT_TOKEN", "test_client_token"),
             patch.object(salon_app, "PADDLE_API_KEY", "server_secret_api_key"),
+            patch.dict(salon_app.app.config, {"SECRET_KEY": "server_secret_key"}),
             patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
             patch.object(salon_app, "PADDLE_YEARLY_PRICE_ID", "pri_yearly"),
         ):
+            expected_binding = salon_app.paddle_salon_binding(3)
             response = self.client.get("/subscription")
 
         body = response.get_data(as_text=True)
@@ -105,7 +124,11 @@ class PaddleIntegrationTests(unittest.TestCase):
         self.assertIn('data-client-token="test_client_token"', body)
         self.assertIn('data-monthly-price-id="pri_monthly"', body)
         self.assertIn('data-yearly-price-id="pri_yearly"', body)
+        self.assertIn(
+            f'data-salon-binding="{expected_binding}"', body,
+        )
         self.assertNotIn("server_secret_api_key", body)
+        self.assertNotIn("server_secret_key", body)
         self.assertIn("https://cdn.paddle.com/paddle/v2/paddle.js", body)
         self.assertIn("https://*.paddle.com", response.headers["Content-Security-Policy"])
 
@@ -166,9 +189,128 @@ class PaddleIntegrationTests(unittest.TestCase):
             response = self.client.get("/subscription")
         self.assertNotIn("Otvori Paddle portal", response.get_data(as_text=True))
 
+    def test_subscription_event_requires_valid_server_salon_binding(self):
+        cases = (
+            ("missing", {"salon_id": "3"}),
+            ("forged", {"salon_id": "3", "salon_binding": "forged"}),
+        )
+
+        for label, custom_data in cases:
+            with self.subTest(label=label):
+                connection, cursor = self.connection([
+                    {"id": 91},
+                    {
+                        "id": 3,
+                        "subscription_status": "trial",
+                        "subscription_grace_ends_at": None,
+                    },
+                    {"id": 3},
+                ])
+                authoritative = self.subscription(custom_data=custom_data)
+
+                with (
+                    patch.object(salon_app, "get_db", return_value=connection),
+                    patch.object(
+                        salon_app,
+                        "fetch_paddle_subscription",
+                        return_value=authoritative,
+                    ),
+                    patch.object(
+                        salon_app,
+                        "PADDLE_MONTHLY_PRICE_ID",
+                        "pri_monthly",
+                    ),
+                ):
+                    response = self.signed_post({
+                        "event_id": f"evt_binding_{label}",
+                        "event_type": "subscription.created",
+                        "data": {"id": "sub_123"},
+                    })
+
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(
+                    any(
+                        "UPDATE salons" in call.args[0]
+                        for call in cursor.execute.call_args_list
+                    )
+                )
+                connection.rollback.assert_called_once()
+
+    def test_subscription_event_rejects_binding_for_a_different_salon(self):
+        connection, cursor = self.connection([{"id": 91}])
+        authoritative = self.subscription(custom_data={
+            "salon_id": "4",
+            "salon_binding": salon_app.paddle_salon_binding(3),
+        })
+
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=authoritative),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_binding_mismatch",
+                "event_type": "subscription.created",
+                "data": {"id": "sub_123"},
+            })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+        connection.rollback.assert_called_once()
+
+    def test_subscription_event_rejects_unknown_price_with_valid_binding(self):
+        connection, cursor = self.connection([{"id": 91}])
+        authoritative = self.subscription(
+            items=[{"price": {"id": "pri_unknown"}}],
+            billing_cycle={"interval": "month"},
+        )
+
+        with (
+            patch.object(salon_app, "get_db", return_value=connection),
+            patch.object(salon_app, "fetch_paddle_subscription", return_value=authoritative),
+            patch.object(salon_app, "PADDLE_MONTHLY_PRICE_ID", "pri_monthly"),
+            patch.object(salon_app, "PADDLE_YEARLY_PRICE_ID", "pri_yearly"),
+        ):
+            response = self.signed_post({
+                "event_id": "evt_unknown_price",
+                "event_type": "subscription.created",
+                "data": {"id": "sub_123"},
+            })
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+        connection.rollback.assert_called_once()
+
+    def test_subscription_event_rejects_malformed_or_non_positive_salon_id(self):
+        for salon_id in ("abc", "0", "-1", "3.5"):
+            with self.subTest(salon_id=salon_id):
+                connection, cursor = self.connection([{"id": 91}])
+                authoritative = self.subscription(custom_data={
+                    "salon_id": salon_id,
+                    "salon_binding": salon_app.paddle_salon_binding(3),
+                })
+
+                with (
+                    patch.object(salon_app, "get_db", return_value=connection),
+                    patch.object(salon_app, "fetch_paddle_subscription", return_value=authoritative),
+                ):
+                    response = self.signed_post({
+                        "event_id": f"evt_invalid_salon_id_{salon_id}",
+                        "event_type": "subscription.created",
+                        "data": {"id": "sub_123"},
+                    })
+
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(any("UPDATE salons" in call.args[0] for call in cursor.execute.call_args_list))
+                connection.rollback.assert_called_once()
+
     def test_valid_subscription_event_fetches_authoritative_data_and_updates_only_salon_id(self):
         connection, cursor = self.connection([{"id": 91}, {"id": 3}, {"id": 3}])
-        authoritative = self.subscription(custom_data={"salon_id": "3", "email": "private@example.com"})
+        authoritative = self.subscription(custom_data={
+            "salon_id": "3",
+            "salon_binding": salon_app.paddle_salon_binding(3),
+            "email": "private@example.com",
+        })
         with (
             patch.object(salon_app, "get_db", return_value=connection),
             patch.object(salon_app, "fetch_paddle_subscription", return_value=authoritative) as fetch,
