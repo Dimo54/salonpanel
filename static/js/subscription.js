@@ -46,6 +46,7 @@
                 customer: config.customerEmail ? { email: config.customerEmail } : undefined,
                 customData: {
                     salon_id: config.salonId,
+                    salon_binding: config.salonBinding,
                     plan,
                 },
                 settings: {

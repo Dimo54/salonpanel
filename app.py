@@ -3753,6 +3753,7 @@ def subscription_page():
         "client_token": PADDLE_CLIENT_TOKEN,
         "monthly_price_id": PADDLE_MONTHLY_PRICE_ID,
         "yearly_price_id": PADDLE_YEARLY_PRICE_ID,
+        "salon_binding": paddle_salon_binding(salon["id"], paddle_environment),
     }
     return render_template(
         "subscription.html",
@@ -3895,6 +3896,25 @@ def positive_int(value):
     return None
 
 
+def paddle_salon_binding(salon_id, environment=None):
+    """Return the server-authenticated binding sent with Paddle checkout data."""
+    salon_id = positive_int(salon_id)
+    environment = PADDLE_ENVIRONMENT if environment is None else environment
+    if salon_id is None or environment not in {"sandbox", "production"}:
+        return ""
+    message = f"paddle-salon-binding:v1:{environment}:{salon_id}".encode("utf-8")
+    return hmac.new(
+        app.config["SECRET_KEY"].encode("utf-8"), message, hashlib.sha256,
+    ).hexdigest()
+
+
+def paddle_salon_binding_is_valid(salon_id, binding):
+    if not isinstance(binding, str):
+        return False
+    expected = paddle_salon_binding(salon_id)
+    return bool(expected) and hmac.compare_digest(expected, binding)
+
+
 def paddle_subscription_status(value):
     return {
         "active": "active",
@@ -3918,12 +3938,6 @@ def paddle_subscription_plan(subscription):
             return "monthly"
         if price_id and price_id == PADDLE_YEARLY_PRICE_ID:
             return "yearly"
-    billing_cycle = subscription.get("billing_cycle")
-    interval = billing_cycle.get("interval") if isinstance(billing_cycle, dict) else None
-    if interval == "month":
-        return "monthly"
-    if interval == "year":
-        return "yearly"
     return None
 
 
@@ -4002,6 +4016,9 @@ def paddle_webhook():
             )
             if salon_id is None:
                 raise PaddleProcessingError("Neispravan salon_id.", 400)
+            salon_binding = custom_data.get("salon_binding") if isinstance(custom_data, dict) else None
+            if not paddle_salon_binding_is_valid(salon_id, salon_binding):
+                raise PaddleProcessingError("Neispravan Paddle salon binding.", 400)
 
             authoritative_id = subscription.get("id")
             customer_id = subscription.get("customer_id")
