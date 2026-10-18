@@ -52,6 +52,61 @@ Preko Brevo servisa aplikacija može slati:
 
 Podsetnici zahtevaju da neki spoljašnji servis pozove zaštićenu adresu `/tasks/send-reminders` jednom na sat.
 
+Podsetnici koriste pravila dospelosti, pa propušten cron ne preskače termin samo
+zato što nije pozvan u uskom vremenskom prozoru: 24h podsetnik važi od 24h do
+2h pre početka, a 2h podsetnik od 2h do samog početka. Termin koji je prvi put
+zakazan unutar 24h ne dobija neadekvatan „sutra” podsetnik, ali ostaje kandidat
+za 2h podsetnik. Svaka promena datuma ili vremena pravi novu verziju rasporeda.
+
+Konvencija vremena za podsetnike je namerna: `appointments.date`/`time`,
+`schedule_started_at` i `reminder_events` `TIMESTAMP` kolone su naive lokalni
+wall-clock vreme u `APP_TIMEZONE`; novi reminder upisi eksplicitno uklanjaju
+timezone tek nakon konverzije u tu zonu. Samo vrednosti koje predstavljaju
+globalni trenutak (npr. Paddle) koriste `TIMESTAMPTZ`/UTC. Istorijski naive
+`created_at` nije sam po sebi dokaz svoje zone i ne konvertuje se bez operatorove
+izričite odluke u rollout koraku.
+
+### Objavljivanje pouzdanih podsetnika
+
+1. Napraviti proverljiv Supabase backup i sačuvati izlaz `pg_dump`/backup job-a.
+2. Zaustaviti reminder cron tokom migracije i deploy prelaza. Proveriti da je
+   PostgreSQL `TimeZone` jednak `APP_TIMEZONE` (podrazumevano `Europe/Belgrade`).
+3. Pre migracije pregledati stvarni tip i semantiku istorijskog
+   `appointments.created_at`. Naive `timestamp` nije dokaz ni UTC ni lokalnog
+   vremena: operator mora na osnovu poznatog istorijskog zapisa odabrati
+   `local-wall-clock` ili `utc`; bez toga se migracija namerno prekida.
+   Isključivo read-only provere su: `SELECT data_type FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'appointments' AND
+   column_name = 'created_at';`, `SHOW TimeZone;` i poređenje nekoliko poznatih
+   vremena nastanka termina sa `created_at`. Uporediti i tadašnji `APP_TIMEZONE`
+   u Render konfiguraciji/logovima; zaključak i uzorke zabeležiti u rollout
+   zapisu pre bilo kakve migracije. Ne birati konvenciju na osnovu pretpostavke.
+4. Iz kontrolisanog operator okruženja uraditi dry-run, zatim `--apply` sa
+   tačnim `--expected-database`, `--expected-timezone`, deklarisanom
+   `--history-timestamp-convention` i potvrdom oblika
+   `APPLY-REMINDER-MIGRATIONS:production:IME_BAZE`; zatim uraditi `--check`.
+   Runner nikada ne stavlja `DATABASE_URL` u process argv i proverava stvarni
+   `current_database()`, timezone, tipove/ograničenja/indekse i backfill.
+   Migracija ima `lock_timeout = 5s`; aktivni PostgreSQL lock može tražiti
+   ponavljanje u mirnom prozoru, umesto beskonačnog čekanja.
+5. Migracija je idempotentna: istorijske `email_events` uspehe prepisuje u
+   `reminder_events`, bez NULL/orphan zapisa. Novi kod pre claim-a proverava
+   legacy v1 evidenciju i dual-write-uje uspešne poruke u `email_events`.
+6. Deploy-ovati novu verziju. `init_db()` na postojećoj bazi više ne sme napraviti
+   reminder šemu; endpoint vraća 503 dok kontrolisana migracija nije kompletna.
+7. Ponovo uključiti cron tek posle uspešnog `--check`. Pozvati ga sa
+   testnom/staging bazom i mock Brevo kredencijalima, zatim u produkciji proveriti
+   samo logove i redove `reminder_events` bez slanja test poruka stvarnim primaocima.
+8. Za rollback zaustaviti novi cron, vratiti prethodni kod, pa uključiti stari
+   cron. Ne brisati nove kolone/tabelu: dual-write uspeha čuva staru deduplikaciju.
+
+Rezervacija pre poziva Brevo-u sprečava paralelne cron duplikate i omogućava
+ograničene retry-je posle istekle rezervacije. Potpuni exactly-once email ipak
+nije moguće garantovati: proces može pasti nakon što Brevo prihvati poruku, a
+pre nego što aplikacija upiše uspeh. Za to bi bila potrebna provajderova
+idempotency podrška ili potvrđen outbox API. Isto važi za pad između novog i
+legacy dual-write-a; rollback zato zahteva zaustavljen cron i proveru evidencije.
+
 ### 5. Pravila online zakazivanja
 
 Salon može podesiti:

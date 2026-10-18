@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -15,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 import http_smoke_test
 import rollout_common
 import run_paddle_migrations
+import run_reminder_migrations
 import validate_environment as environment_command
 
 
@@ -74,6 +76,114 @@ class MigrationToolingTests(unittest.TestCase):
             result = run_paddle_migrations.main(["--apply", "--environment", "production"])
         self.assertEqual(result, 2)
         run.assert_not_called()
+
+    def test_reminder_runner_keeps_database_url_out_of_psql_argv(self):
+        url = "postgresql://user:private-password@localhost:5433/salonpanel_reminders_test?sslmode=require"
+        environment = run_reminder_migrations.connection_environment(url, "Europe/Belgrade", "utc")
+        command = run_reminder_migrations.psql_command("--command", "SELECT 1")
+        self.assertNotIn(url, command)
+        self.assertNotIn("private-password", " ".join(command))
+        self.assertEqual(environment["PGDATABASE"], "salonpanel_reminders_test")
+        self.assertEqual(environment["PGSSLMODE"], "require")
+        self.assertIn("history_timestamp_convention=utc", environment["PGOPTIONS"])
+
+    def test_reminder_apply_requires_target_and_history_confirmation_before_connection(self):
+        with (
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://example.invalid/app"}, clear=True),
+            patch.object(run_reminder_migrations.shutil, "which", return_value="/usr/bin/psql"),
+            patch.object(run_reminder_migrations.subprocess, "run") as run,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = run_reminder_migrations.main(["--apply", "--environment", "production", "--expected-database", "app"])
+        self.assertEqual(result, 2)
+        run.assert_not_called()
+
+    def test_reminder_runner_removes_inherited_libpq_overrides(self):
+        with patch.dict(os.environ, {
+            "PGHOSTADDR": "203.0.113.9", "PGSERVICE": "unsafe", "PGSERVICEFILE": "/tmp/unsafe",
+            "PGSSLMODE": "disable", "PGOPTIONS": "-c search_path=unsafe",
+        }, clear=False):
+            environment = run_reminder_migrations.connection_environment(
+                "postgresql://user:password@db.example.com:5432/salon?sslmode=verify-full",
+                "Europe/Belgrade",
+            )
+        for name in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"):
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["PGHOST"], "db.example.com")
+        self.assertEqual(environment["PGPORT"], "5432")
+        self.assertEqual(environment["PGSSLMODE"], "verify-full")
+        self.assertIn("TimeZone=Europe/Belgrade", environment["PGOPTIONS"])
+
+    def test_reminder_runner_rejects_unsafe_remote_ssl_mode(self):
+        with self.assertRaises(ValueError):
+            run_reminder_migrations.connection_environment(
+                "postgresql://user:password@db.example.com/salon?sslmode=disable",
+                "Europe/Belgrade",
+            )
+
+    def test_reminder_runner_allows_disable_only_for_local_docker_target(self):
+        environment = run_reminder_migrations.connection_environment(
+            "postgresql://user:password@127.0.0.1:55432/salonpanel_reminders_test?sslmode=disable",
+            "Europe/Belgrade",
+        )
+        self.assertEqual(environment["PGSSLMODE"], "disable")
+
+    def test_reminder_runner_rejects_wrong_target_before_connection(self):
+        for expected_database, expected_host, expected_port in (
+            ("salon", "db.example.com", "5432"),
+            ("other", "other.example.com", "5432"),
+            ("other", "db.example.com", "5433"),
+        ):
+            with self.subTest(database=expected_database, host=expected_host, port=expected_port):
+                with (
+                    patch.dict(os.environ, {"DATABASE_URL": "postgresql://user:password@db.example.com:5432/other"}, clear=True),
+                    patch.object(run_reminder_migrations.shutil, "which", return_value="/usr/bin/psql"),
+                    patch.object(run_reminder_migrations.subprocess, "run") as run,
+                    contextlib.redirect_stderr(io.StringIO()),
+                ):
+                    result = run_reminder_migrations.main([
+                        "--check", "--environment", "staging", "--expected-database", expected_database,
+                        "--expected-host", expected_host, "--expected-port", expected_port,
+                    ])
+                self.assertEqual(result, 2)
+                run.assert_not_called()
+
+    def test_reminder_target_confirmation_accepts_docker_port_forwarding(self):
+        environment = run_reminder_migrations.connection_environment(
+            "postgresql://user:password@127.0.0.1:55432/salonpanel_reminders_runner_backup?sslmode=disable",
+            "Europe/Belgrade",
+        )
+        completed = SimpleNamespace(returncode=0, stdout="salonpanel_reminders_runner_backup|Europe/Belgrade\n")
+        with patch.object(run_reminder_migrations, "run_psql", return_value=completed) as run:
+            accepted, _ = run_reminder_migrations.target_confirmation(
+                environment, "salonpanel_reminders_runner_backup", "127.0.0.1", 55432, "Europe/Belgrade",
+            )
+        self.assertTrue(accepted)
+        command = run.call_args.args[1:]
+        self.assertNotIn("inet_server_addr", " ".join(command))
+        self.assertNotIn("inet_server_port", " ".join(command))
+
+    def test_reminder_target_confirmation_rejects_wrong_timezone_or_configured_endpoint(self):
+        environment = run_reminder_migrations.connection_environment(
+            "postgresql://user:password@127.0.0.1:55432/salonpanel_reminders_runner_backup?sslmode=disable",
+            "Europe/Belgrade",
+        )
+        with patch.object(
+            run_reminder_migrations, "run_psql",
+            return_value=SimpleNamespace(returncode=0, stdout="salonpanel_reminders_runner_backup|UTC\n"),
+        ):
+            accepted, _ = run_reminder_migrations.target_confirmation(
+                environment, "salonpanel_reminders_runner_backup", "127.0.0.1", 55432, "Europe/Belgrade",
+            )
+        self.assertFalse(accepted)
+        with patch.object(
+            run_reminder_migrations, "run_psql",
+            return_value=SimpleNamespace(returncode=0, stdout="salonpanel_reminders_runner_backup|Europe/Belgrade\n"),
+        ):
+            accepted, _ = run_reminder_migrations.target_confirmation(
+                environment, "salonpanel_reminders_runner_backup", "127.0.0.1", 9999, "Europe/Belgrade",
+            )
+        self.assertFalse(accepted)
 
 
 class EnvironmentValidatorTests(unittest.TestCase):

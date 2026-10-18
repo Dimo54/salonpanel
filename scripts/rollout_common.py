@@ -15,6 +15,9 @@ MIGRATION_FILES = (
     "20260805_add_paddle_subscription_updated_at.sql",
     "20260805_add_subscription_grace_ends_at.sql",
 )
+REMINDER_MIGRATION_FILES = (
+    "20261015_reliable_reminders.sql",
+)
 
 ROLLOUT_ENVIRONMENT_VARIABLES = (
     "DATABASE_URL",
@@ -41,6 +44,14 @@ def migration_paths(root: Path = REPOSITORY_ROOT) -> tuple[Path, ...]:
 
 def missing_migrations(root: Path = REPOSITORY_ROOT) -> list[str]:
     return [path.name for path in migration_paths(root) if not path.is_file()]
+
+
+def reminder_migration_paths(root: Path = REPOSITORY_ROOT) -> tuple[Path, ...]:
+    return tuple(root / "migrations" / name for name in REMINDER_MIGRATION_FILES)
+
+
+def missing_reminder_migrations(root: Path = REPOSITORY_ROOT) -> list[str]:
+    return [path.name for path in reminder_migration_paths(root) if not path.is_file()]
 
 
 def _integer_in_range(value: str, minimum: int, maximum: int) -> bool:
