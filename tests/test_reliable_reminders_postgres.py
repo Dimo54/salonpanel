@@ -6,7 +6,7 @@ listed in APPROVED_TEST_DATABASES. This module never falls back to DATABASE_URL.
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from unittest.mock import patch
@@ -23,6 +23,7 @@ TEST_URL = os.environ.get("SALONPANEL_TEST_DATABASE_URL", "")
 APPROVED_TEST_DATABASES = frozenset({
     "salonpanel_reminders_test",
     "salonpanel_reminders_final_test",
+    "salonpanel_reminders_legacy_past_test",
 })
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 LOCAL_TEST_PORT = 55432
@@ -68,7 +69,16 @@ class ReliableReminderPostgresTests(unittest.TestCase):
                 self.connection.close()
                 self.fail("refusing to modify a non-empty test database")
             cur.execute("CREATE TABLE salons (id integer PRIMARY KEY)")
-            cur.execute("CREATE TABLE appointments (id integer PRIMARY KEY, salon_id integer NOT NULL, created_at timestamp NOT NULL)")
+            cur.execute("""
+                CREATE TABLE appointments (
+                    id integer PRIMARY KEY,
+                    salon_id integer NOT NULL,
+                    date date NOT NULL DEFAULT CURRENT_DATE - 1,
+                    time time NOT NULL DEFAULT TIME '09:00',
+                    status text NOT NULL DEFAULT 'scheduled',
+                    created_at timestamp NOT NULL
+                )
+            """)
             cur.execute("""
                 CREATE TABLE email_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -83,7 +93,10 @@ class ReliableReminderPostgresTests(unittest.TestCase):
                 )
             """)
             cur.execute("INSERT INTO salons VALUES (1)")
-            cur.execute("INSERT INTO appointments VALUES (10, 1, %s)", (datetime(2029, 1, 2, 8, 30),))
+            cur.execute("""
+                INSERT INTO appointments (id, salon_id, date, time, status, created_at)
+                VALUES (10, 1, CURRENT_DATE - 1, TIME '09:00', 'scheduled', %s)
+            """, (datetime(2029, 1, 2, 8, 30),))
             cur.execute("INSERT INTO email_events (salon_id, appointment_id, event_key, successful, created_at) VALUES (NULL, 10, 'reminder-24h', TRUE, %s), (NULL, NULL, 'reminder-2h', TRUE, %s)", (datetime(2029, 1, 3), datetime(2029, 1, 3)))
         self.connection.commit()
         self.created_tables = True
@@ -96,18 +109,21 @@ class ReliableReminderPostgresTests(unittest.TestCase):
                     self.fail("refusing cleanup: database identity changed")
                 # These are tables created above in an empty dedicated database;
                 # no CASCADE is used and no pre-existing data is ever removed.
-                cur.execute("DROP TABLE reminder_events")
+                cur.execute("DROP TABLE IF EXISTS reminder_events")
                 cur.execute("DROP TABLE email_events")
                 cur.execute("DROP TABLE appointments")
                 cur.execute("DROP TABLE salons")
             self.connection.commit()
         self.connection.close()
 
-    def apply(self):
+    def apply(self, convention="local-wall-clock"):
         sql = Path("migrations/20261015_reliable_reminders.sql").read_text(encoding="utf-8")
         with self.connection.cursor() as cur:
             cur.execute("SET TIME ZONE 'Europe/Belgrade'")
-            cur.execute("SET salonpanel.history_timestamp_convention TO 'local-wall-clock'")
+            cur.execute(
+                "SELECT set_config('salonpanel.history_timestamp_convention', %s, false)",
+                (convention,),
+            )
             cur.execute(sql)
         self.connection.commit()
 
@@ -129,6 +145,78 @@ class ReliableReminderPostgresTests(unittest.TestCase):
         with self.connection.cursor() as cur:
             cur.execute("SELECT schedule_started_at FROM appointments WHERE id = 10")
             self.assertEqual(cur.fetchone()[0], datetime(2029, 1, 2, 9, 30))
+
+    def test_legacy_past_only_backfills_neutral_anchor_and_legacy_success_idempotently(self):
+        self.apply("legacy-past-only")
+        self.apply("legacy-past-only")
+        with self.connection.cursor() as cur:
+            cur.execute("SELECT date, schedule_started_at, schedule_version FROM appointments WHERE id = 10")
+            appointment_date, schedule_started_at, schedule_version = cur.fetchone()
+            self.assertEqual(schedule_started_at, datetime.combine(appointment_date, time.min))
+            self.assertEqual(schedule_version, 1)
+            cur.execute("SELECT reminder_type, state, count(*) FROM reminder_events GROUP BY reminder_type, state")
+            self.assertEqual(cur.fetchall(), [("reminder_24h", "successful", 1)])
+
+        # A neutral anchor for a past appointment cannot make it reminder due.
+        row = {
+            "date": appointment_date,
+            "time": time(9),
+            "status": "scheduled",
+            "schedule_started_at": schedule_started_at,
+        }
+        now = datetime.combine(appointment_date + timedelta(days=1), time(10), salon_app.ZoneInfo("Europe/Belgrade"))
+        self.assertIsNone(salon_app.due_reminder_type(row, now))
+
+    def test_legacy_past_only_rejects_today_or_future_appointments(self):
+        for offset in (0, 1):
+            with self.subTest(offset=offset):
+                with self.connection.cursor() as cur:
+                    cur.execute("UPDATE appointments SET date = CURRENT_DATE + %s WHERE id = 10", (offset,))
+                self.connection.commit()
+                with self.assertRaises(psycopg.Error):
+                    self.apply("legacy-past-only")
+                self.connection.rollback()
+
+    def test_legacy_past_only_historical_reschedule_gets_new_local_schedule_version(self):
+        self.apply("legacy-past-only")
+        rescheduled_at = datetime(2030, 5, 10, 11, 30)
+        new_date = rescheduled_at.date()
+        new_time = rescheduled_at.time()
+        with self.connection.cursor() as cur:
+            # This is the production schedule-version transition expressed
+            # against a real migrated PostgreSQL row.
+            cur.execute("""
+                UPDATE appointments
+                SET date = %s, time = %s,
+                    schedule_version = CASE WHEN date IS DISTINCT FROM %s OR time IS DISTINCT FROM %s
+                        THEN schedule_version + 1 ELSE schedule_version END,
+                    schedule_started_at = CASE WHEN date IS DISTINCT FROM %s OR time IS DISTINCT FROM %s
+                        THEN %s ELSE schedule_started_at END
+                WHERE id = 10
+            """, (new_date, new_time, new_date, new_time, new_date, new_time, rescheduled_at))
+        self.connection.commit()
+        # A completed migration remains idempotent after this now-future row
+        # exists; the past-only gate applies only while a backfill is needed.
+        self.apply("legacy-past-only")
+        with self.connection.cursor() as cur:
+            cur.execute("SELECT schedule_version, schedule_started_at FROM appointments WHERE id = 10")
+            self.assertEqual(cur.fetchone(), (2, rescheduled_at))
+
+    def test_legacy_past_only_lock_blocks_concurrent_appointment_insert(self):
+        """The migration's table lock rejects concurrent appointment writes."""
+        self.assertIn("LOCK TABLE appointments IN SHARE ROW EXCLUSIVE MODE", Path(
+            "migrations/20261015_reliable_reminders.sql"
+        ).read_text(encoding="utf-8"))
+        with psycopg.connect(self.local_test_url) as holder, psycopg.connect(self.local_test_url) as writer:
+            with holder.cursor() as cur:
+                cur.execute("BEGIN")
+                cur.execute("LOCK TABLE appointments IN SHARE ROW EXCLUSIVE MODE")
+            with writer.cursor() as cur:
+                cur.execute("SET lock_timeout = '200ms'")
+                with self.assertRaises(psycopg.errors.LockNotAvailable):
+                    cur.execute("INSERT INTO appointments (id, salon_id, created_at) VALUES (11, 1, CURRENT_TIMESTAMP)")
+            writer.rollback()
+            holder.rollback()
 
     def test_parallel_claim_allows_exactly_one_active_lease_then_reclaims_after_expiry(self):
         """Two real DB connections cannot both reserve the same reminder row."""

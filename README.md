@@ -74,14 +74,24 @@ izričite odluke u rollout koraku.
 3. Pre migracije pregledati stvarni tip i semantiku istorijskog
    `appointments.created_at`. Naive `timestamp` nije dokaz ni UTC ni lokalnog
    vremena: operator mora na osnovu poznatog istorijskog zapisa odabrati
-   `local-wall-clock` ili `utc`; bez toga se migracija namerno prekida.
+   `local-wall-clock` ili `utc`; bez toga se migracija namerno prekida. Jedini
+   izuzetak je eksplicitni `legacy-past-only`: dozvoljen je samo kada read-only
+   dokaz pokaže da je svaki postojeći termin strogo pre današnjeg datuma u
+   `APP_TIMEZONE`. Migracija tada pod transakcionim lock-om ponavlja proveru,
+   ne čita niti konvertuje `created_at`, i upisuje neutralni legacy anchor
+   `date 00:00` u `schedule_started_at`. To nije vreme zakazivanja niti
+   stvaranja termina; prošli termini nikada nisu reminder-due.
    Isključivo read-only provere su: `SELECT data_type FROM information_schema.columns
    WHERE table_schema = 'public' AND table_name = 'appointments' AND
    column_name = 'created_at';`, `SHOW TimeZone;` i poređenje nekoliko poznatih
    vremena nastanka termina sa `created_at`. Uporediti i tadašnji `APP_TIMEZONE`
    u Render konfiguraciji/logovima; zaključak i uzorke zabeležiti u rollout
    zapisu pre bilo kakve migracije. Ne birati konvenciju na osnovu pretpostavke.
-4. Iz kontrolisanog operator okruženja uraditi dry-run, zatim `--apply` sa
+4. Za `legacy-past-only` maintenance prozor mora da blokira i nova zakazivanja
+   od početka migracije do deploy-a novog koda. Sam PostgreSQL lock štiti samo
+   trajanje transakcije; stari kod bi posle commita mogao da kreira budući
+   termin sa host/session-vremenskim default-om. Cron mora ostati zaustavljen.
+5. Iz kontrolisanog operator okruženja uraditi dry-run, zatim `--apply` sa
    tačnim `--expected-database`, `--expected-timezone`, deklarisanom
    `--history-timestamp-convention` i potvrdom oblika
    `APPLY-REMINDER-MIGRATIONS:production:IME_BAZE`; zatim uraditi `--check`.
@@ -89,15 +99,15 @@ izričite odluke u rollout koraku.
    `current_database()`, timezone, tipove/ograničenja/indekse i backfill.
    Migracija ima `lock_timeout = 5s`; aktivni PostgreSQL lock može tražiti
    ponavljanje u mirnom prozoru, umesto beskonačnog čekanja.
-5. Migracija je idempotentna: istorijske `email_events` uspehe prepisuje u
+6. Migracija je idempotentna: istorijske `email_events` uspehe prepisuje u
    `reminder_events`, bez NULL/orphan zapisa. Novi kod pre claim-a proverava
    legacy v1 evidenciju i dual-write-uje uspešne poruke u `email_events`.
-6. Deploy-ovati novu verziju. `init_db()` na postojećoj bazi više ne sme napraviti
+7. Deploy-ovati novu verziju. `init_db()` na postojećoj bazi više ne sme napraviti
    reminder šemu; endpoint vraća 503 dok kontrolisana migracija nije kompletna.
-7. Ponovo uključiti cron tek posle uspešnog `--check`. Pozvati ga sa
+8. Ponovo uključiti cron tek posle uspešnog `--check`. Pozvati ga sa
    testnom/staging bazom i mock Brevo kredencijalima, zatim u produkciji proveriti
    samo logove i redove `reminder_events` bez slanja test poruka stvarnim primaocima.
-8. Za rollback zaustaviti novi cron, vratiti prethodni kod, pa uključiti stari
+9. Za rollback zaustaviti novi cron, vratiti prethodni kod, pa uključiti stari
    cron. Ne brisati nove kolone/tabelu: dual-write uspeha čuva staru deduplikaciju.
 
 Rezervacija pre poziva Brevo-u sprečava paralelne cron duplikate i omogućava

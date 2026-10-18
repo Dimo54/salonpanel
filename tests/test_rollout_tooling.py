@@ -87,6 +87,18 @@ class MigrationToolingTests(unittest.TestCase):
         self.assertEqual(environment["PGSSLMODE"], "require")
         self.assertIn("history_timestamp_convention=utc", environment["PGOPTIONS"])
 
+    def test_reminder_runner_allows_explicit_legacy_past_only_convention(self):
+        environment = run_reminder_migrations.connection_environment(
+            "postgresql://user:password@127.0.0.1:55432/salonpanel_reminders_legacy_past_test?sslmode=disable",
+            "Europe/Belgrade",
+            "legacy-past-only",
+        )
+        parsed = run_reminder_migrations.build_parser().parse_args([
+            "--apply", "--history-timestamp-convention", "legacy-past-only",
+        ])
+        self.assertEqual(parsed.history_timestamp_convention, "legacy-past-only")
+        self.assertIn("history_timestamp_convention=legacy-past-only", environment["PGOPTIONS"])
+
     def test_reminder_apply_requires_target_and_history_confirmation_before_connection(self):
         with (
             patch.dict(os.environ, {"DATABASE_URL": "postgresql://example.invalid/app"}, clear=True),

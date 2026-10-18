@@ -49,6 +49,23 @@ source, session timezone, Render configuration, chosen convention, and reviewer
 before supplying `--history-timestamp-convention`. These SQL statements are
 read-only; do not run a migration until the conclusion is documented.
 
+### Narrow legacy-past-only exception
+
+`legacy-past-only` is not a timezone conclusion. It is available only when a
+read-only production check proves that every appointment, regardless of status,
+has `date < CURRENT_DATE` in the runner session whose `TimeZone` equals
+`APP_TIMEZONE`. The migration takes write-blocking locks on `appointments` and
+`email_events`, repeats that check inside its transaction, leaves `created_at`
+unchanged, and writes `date 00:00` as a neutral legacy schedule anchor. Past
+appointments are not reminder-due; a later date/time move by the new code
+increments `schedule_version` and writes a fresh local `schedule_started_at`.
+
+This exception requires a maintenance window: pause the old reminder cron and
+block appointment creation/edits from before the migration until the new code
+is live. The transaction lock cannot prevent an old application instance from
+creating a future appointment after the migration commits. If such a write
+freeze cannot be verified, do not use `legacy-past-only`.
+
 Rollback is complete only when the prior revision is confirmed live, smoke tests pass, billing changes are paused or safe, logs contain no sensitive data, and the incident record includes the deployed SHA and remaining follow-up.
 
 Render notes that dashboard rollback reuses the selected deploy artifact and disables Auto-Deploy; current service configuration and stateful resources have specific exceptions. Review the current [Render rollback documentation](https://render.com/docs/rollbacks) before executing.

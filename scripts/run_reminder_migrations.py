@@ -12,7 +12,7 @@ from rollout_common import missing_reminder_migrations, reminder_migration_paths
 
 
 PRODUCTION_CONFIRMATION_PREFIX = "APPLY-REMINDER-MIGRATIONS"
-HISTORY_CONVENTIONS = ("local-wall-clock", "utc")
+HISTORY_CONVENTIONS = ("local-wall-clock", "utc", "legacy-past-only")
 LOCAL_DOCKER_HOST = "127.0.0.1"
 LOCAL_DOCKER_PORT = 55432
 CHECK_SQL = """
@@ -60,7 +60,7 @@ def build_parser():
     parser.add_argument("--expected-port", type=int, help="Exact PostgreSQL port approved by the operator.")
     parser.add_argument("--expected-timezone", default=os.environ.get("APP_TIMEZONE", "Europe/Belgrade"))
     parser.add_argument("--history-timestamp-convention", choices=HISTORY_CONVENTIONS,
-                        help="Required for apply when legacy naive timestamps need backfill.")
+                        help="Required for apply when historical appointment timestamps need backfill.")
     parser.add_argument("--confirm-target", default="", help=argparse.SUPPRESS)
     return parser
 

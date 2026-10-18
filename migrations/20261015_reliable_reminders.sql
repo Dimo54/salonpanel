@@ -1,10 +1,16 @@
 -- Run with a PostgreSQL session whose TimeZone matches APP_TIMEZONE.
 -- For a naive historical created_at, the operator MUST set
--- salonpanel.history_timestamp_convention to local-wall-clock or utc.  Do not
--- guess: old deployments may have used either a UTC server session or local
--- application timestamps.
+-- salonpanel.history_timestamp_convention to local-wall-clock, utc, or the
+-- narrowly-scoped legacy-past-only mode. Do not guess: old deployments may
+-- have used either a UTC server session or local application timestamps.
 BEGIN;
 SET LOCAL lock_timeout = '5s';
+
+-- Block appointment and email-event writes while the historical safety check
+-- and legacy backfill run. The rollout still requires a booking/cron pause
+-- until the new code is deployed; this lock only closes the in-transaction gap.
+LOCK TABLE appointments IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE email_events IN SHARE ROW EXCLUSIVE MODE;
 
 -- Do not use NOT NULL DEFAULT CURRENT_TIMESTAMP here: that would assign the
 -- migration instant to historical appointments and manufacture false 24h jobs.
@@ -29,13 +35,29 @@ BEGIN
     SELECT count(*) INTO rows_to_backfill
       FROM appointments WHERE schedule_started_at IS NULL;
 
-    IF created_at_type = 'timestamp with time zone' THEN
+    IF rows_to_backfill = 0 THEN
+        -- Re-applying after a completed migration must remain idempotent even
+        -- after new appointments exist.
+        NULL;
+    ELSIF history_convention = 'legacy-past-only' THEN
+        -- This mode deliberately makes no claim about created_at. It is safe
+        -- only when every existing appointment is strictly before CURRENT_DATE
+        -- in the runner-controlled APP_TIMEZONE session.
+        IF EXISTS (SELECT 1 FROM appointments WHERE date IS NULL OR date >= CURRENT_DATE) THEN
+            RAISE EXCEPTION 'legacy-past-only requires every appointment date to be before CURRENT_DATE';
+        END IF;
+        -- A date-at-midnight value is a neutral legacy schedule anchor, not an
+        -- inferred creation instant. Past appointments are never reminder due;
+        -- any later reschedule receives a new local schedule_started_at/version
+        -- from the deployed application.
+        UPDATE appointments
+        SET schedule_started_at = COALESCE(schedule_started_at, date::timestamp)
+        WHERE schedule_started_at IS NULL;
+    ELSIF created_at_type = 'timestamp with time zone' THEN
         EXECUTE 'UPDATE appointments
                  SET schedule_started_at = COALESCE(schedule_started_at,
                      created_at AT TIME ZONE current_setting(''TimeZone''))
                  WHERE schedule_started_at IS NULL';
-    ELSIF rows_to_backfill = 0 THEN
-        NULL;
     ELSIF history_convention = 'local-wall-clock' THEN
         UPDATE appointments
         SET schedule_started_at = COALESCE(schedule_started_at, created_at, CURRENT_TIMESTAMP)
