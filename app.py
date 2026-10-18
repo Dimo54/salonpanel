@@ -79,6 +79,8 @@ PADDLE_SUBSCRIPTION_EVENT_TYPES = frozenset(
 )
 BOOKING_SLOT_MINUTES = 10
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+APPOINTMENT_WRITE_FREEZE_ENV = "SALONPANEL_APPOINTMENT_WRITE_FREEZE"
+APPOINTMENT_WRITE_FREEZE_MESSAGE = "Zakazivanje i izmene termina su privremeno obustavljeni."
 
 app = Flask(__name__, instance_relative_config=True)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -194,9 +196,25 @@ def database_url() -> str:
     return value
 
 
+def appointment_writes_frozen() -> bool:
+    """Return the explicit rollout freeze state; default remains writable."""
+    return os.environ.get(APPOINTMENT_WRITE_FREEZE_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def get_db():
     if "db" not in g:
-        g.db = psycopg.connect(database_url(), row_factory=dict_row)
+        connection = psycopg.connect(database_url(), row_factory=dict_row)
+        # The later reliable-reminder migration recognizes this session GUC.
+        # A raw a8fa83d process cannot opt into appointment writes.
+        if not appointment_writes_frozen():
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('salonpanel.appointment_write_freeze_bypass', 'on', false)"
+                )
+            connection.commit()
+        g.db = connection
     return g.db
 
 
@@ -240,8 +258,14 @@ class SalonNameConfirmationError(Exception):
     pass
 
 
+class AppointmentWriteFrozenError(Exception):
+    pass
+
+
 def delete_salon_tenant_data(salon_id, confirmed_name):
     """Delete one salon and all of its tenant-owned data atomically."""
+    if appointment_writes_frozen():
+        raise AppointmentWriteFrozenError
     connection = get_db()
     try:
         with connection.cursor() as cur:
@@ -508,11 +532,6 @@ def init_db():
     ALTER TABLE salons ADD COLUMN IF NOT EXISTS subscription_grace_ends_at TIMESTAMPTZ;
 
     UPDATE salons SET slot_minutes = 10 WHERE slot_minutes IS DISTINCT FROM 10;
-    UPDATE appointments a
-    SET duration_minutes = s.duration_minutes
-    FROM services s
-    WHERE a.service_id = s.id AND a.worker_id IS NULL;
-
     CREATE INDEX IF NOT EXISTS idx_users_salon_id ON users(salon_id);
     CREATE INDEX IF NOT EXISTS idx_clients_salon_id ON clients(salon_id);
     CREATE INDEX IF NOT EXISTS idx_clients_salon_phone_normalized ON clients(salon_id, phone_normalized);
@@ -538,6 +557,13 @@ def init_db():
     with get_db().cursor() as cur:
         cur.execute(schema)
     get_db().commit()
+    if not appointment_writes_frozen():
+        db_execute("""
+            UPDATE appointments a
+            SET duration_minutes = s.duration_minutes
+            FROM services s
+            WHERE a.service_id = s.id AND a.worker_id IS NULL
+        """)
     ensure_default_workers()
     ensure_all_working_hours()
     seed_super_admin()
@@ -644,10 +670,11 @@ def ensure_salon_default_worker(salon_id: int):
             (worker["id"], datetime.now(), datetime.now(), salon_id),
         )
 
-    db_execute(
-        "UPDATE appointments SET worker_id = %s WHERE salon_id = %s AND worker_id IS NULL",
-        (worker["id"], salon_id),
-    )
+    if not appointment_writes_frozen():
+        db_execute(
+            "UPDATE appointments SET worker_id = %s WHERE salon_id = %s AND worker_id IS NULL",
+            (worker["id"], salon_id),
+        )
     return worker["id"]
 
 
@@ -1935,6 +1962,8 @@ def persist_appointment_locked(
     public_request=False,
     public_token=None,
 ):
+    if appointment_writes_frozen():
+        return None, APPOINTMENT_WRITE_FREEZE_MESSAGE
     connection = get_db()
     try:
         with connection.cursor() as cur:
@@ -2600,6 +2629,9 @@ def appointment_new():
     salon_id = current_salon()["id"]
     appointment = {}
     if request.method == "POST":
+        if appointment_writes_frozen():
+            flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
+            return redirect(url_for("appointments"))
         result = save_appointment()
         if result:
             flash("Termin je dodat.", "success")
@@ -2641,6 +2673,9 @@ def appointment_edit(appointment_id):
 
     appointment_data = dict(appointment)
     if request.method == "POST":
+        if appointment_writes_frozen():
+            flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
+            return redirect(url_for("appointments"))
         result = save_appointment(appointment_id)
         if result:
             flash("Termin je sacuvan.", "success")
@@ -2801,6 +2836,9 @@ def send_appointment_event(appointment_id, salon_id, event_key, message_type, on
 @app.route("/appointments/<int:appointment_id>/status", methods=["POST"])
 @salon_required
 def appointment_status(appointment_id):
+    if appointment_writes_frozen():
+        flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
+        return redirect(safe_referrer_redirect("appointments"))
     salon = current_salon()
     salon_id = salon["id"]
     new_status = request.form.get("status", "").strip()
@@ -2860,6 +2898,9 @@ def appointment_status(appointment_id):
 @app.route("/appointments/<int:appointment_id>/delete", methods=["POST"])
 @salon_required
 def appointment_delete(appointment_id):
+    if appointment_writes_frozen():
+        flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
+        return redirect(url_for("appointments"))
     salon_id = current_salon()["id"]
     appointment = db_query(
         "SELECT * FROM appointments WHERE id = %s AND salon_id = %s",
@@ -4225,6 +4266,10 @@ def public_booking(slug):
 
     salon_id = salon["id"]
     if request.method == "POST":
+        # Reject before the rate-limit write and before contact/client work.
+        if appointment_writes_frozen():
+            flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
+            return render_template("booking.html", **public_booking_context(salon, dict(request.form)))
         ip_address = request_ip()
         if rate_limit_exceeded(
             "public-booking-submit",
@@ -4630,6 +4675,9 @@ def super_admin_delete_salon(salon_id):
     confirmed_name = request.form.get("salon_name_confirmation", "")
     try:
         salon = delete_salon_tenant_data(salon_id, confirmed_name)
+    except AppointmentWriteFrozenError:
+        flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
+        return redirect(url_for("super_admin_salon_detail", salon_id=salon_id))
     except SalonNotFoundError:
         flash("Salon nije pronađen.", "error")
         return redirect(url_for("super_admin_salons"))
