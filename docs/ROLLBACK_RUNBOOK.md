@@ -10,6 +10,12 @@
 6. Verify protected access and subscription recovery with the controlled authenticated test account; confirm public booking still works without submission.
 7. Inspect Paddle delivery and sanitized application logs. Preserve failed/duplicate events; do not replay until event ordering, idempotency, and the failure cause are understood.
 8. For a reliable-reminder rollback, stop the new reminder cron before restoring code. Leave `appointments.schedule_version`, `schedule_started_at`, and `reminder_events` in place. Successful new reminders are dual-written to legacy `email_events`, so the old code retains its deduplication evidence.
+   If the rollout used `legacy-past-only`, do **not** roll back directly to raw
+   `a8fa83d`: its connections cannot pass the persistent appointment-write
+   guard. Roll back only to the prepared freeze-aware compatibility revision,
+   keep `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1` until it is confirmed live, and
+   do not unfreeze old scheduling until the schedule-version consequence below
+   has been explicitly accepted.
 9. Re-enable only the restored revision's cron after checking the legacy reminder evidence and sanitized logs. Never run old and new reminder cron workers concurrently.
 10. Brevo has no confirmed exactly-once delivery contract here: a process may stop after Brevo accepts a message and before the database commit. Preserve the processing/event rows; investigate before replaying or manually retrying any reminder.
 11. Old code does not increment `schedule_version` when it reschedules an appointment. After rollback, such a moved appointment can miss a reminder on a later reliable-reminder redeploy; record the affected appointments and avoid treating this rollback interval as complete schedule-version history.
@@ -61,10 +67,16 @@ appointments are not reminder-due; a later date/time move by the new code
 increments `schedule_version` and writes a fresh local `schedule_started_at`.
 
 This exception requires a maintenance window: pause the old reminder cron and
-block appointment creation/edits from before the migration until the new code
-is live. The transaction lock cannot prevent an old application instance from
-creating a future appointment after the migration commits. If such a write
-freeze cannot be verified, do not use `legacy-past-only`.
+set `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1` on the prepared freeze-aware
+compatibility deployment before migration. Confirm actual booking/status/delete
+rejection after the Render deploy completes; changing an env value alone does
+not modify a running process. The migration then installs a persistent
+database-level `appointments` write guard. Raw old application connections have
+no bypass setting and remain rejected after commit, including during a Render
+old/new overlap. Deploy the new revision with the flag still `1`; after startup
+and post-migration checks, set it to `0` and redeploy that same SHA. A
+freeze-aware connection is the only process that can then write appointments.
+If any of these checks cannot be verified, do not use `legacy-past-only`.
 
 Rollback is complete only when the prior revision is confirmed live, smoke tests pass, billing changes are paused or safe, logs contain no sensitive data, and the incident record includes the deployed SHA and remaining follow-up.
 

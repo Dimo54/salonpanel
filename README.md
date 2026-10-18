@@ -88,9 +88,15 @@ izričite odluke u rollout koraku.
    u Render konfiguraciji/logovima; zaključak i uzorke zabeležiti u rollout
    zapisu pre bilo kakve migracije. Ne birati konvenciju na osnovu pretpostavke.
 4. Za `legacy-past-only` maintenance prozor mora da blokira i nova zakazivanja
-   od početka migracije do deploy-a novog koda. Sam PostgreSQL lock štiti samo
-   trajanje transakcije; stari kod bi posle commita mogao da kreira budući
-   termin sa host/session-vremenskim default-om. Cron mora ostati zaustavljen.
+   od početka migracije do deploy-a novog koda. Uz `legacy-past-only` migracija
+   zato postavlja database-level write guard: neizmenjeni stari proces ne može
+   da INSERT/UPDATE/DELETE-uje `appointments` ni posle commita, uključujući
+   Render old/new overlap. Nova aplikacija propušta guard samo kada je
+   `SALONPANEL_APPOINTMENT_WRITE_FREEZE` eksplicitno isključen. Pre migracije
+   deploy-ovati freeze-aware kompatibilnu reviziju, postaviti varijablu na `1`,
+   sačekati da Render završi deploy i proveriti odbijanje booking/status/delete
+   zahteva. Cron mora ostati zaustavljen. Ne tretirati samu izmenu Render env
+   varijable kao trenutnu promenu već pokrenutog procesa.
 5. Iz kontrolisanog operator okruženja uraditi dry-run, zatim `--apply` sa
    tačnim `--expected-database`, `--expected-timezone`, deklarisanom
    `--history-timestamp-convention` i potvrdom oblika
@@ -102,8 +108,12 @@ izričite odluke u rollout koraku.
 6. Migracija je idempotentna: istorijske `email_events` uspehe prepisuje u
    `reminder_events`, bez NULL/orphan zapisa. Novi kod pre claim-a proverava
    legacy v1 evidenciju i dual-write-uje uspešne poruke u `email_events`.
-7. Deploy-ovati novu verziju. `init_db()` na postojećoj bazi više ne sme napraviti
-   reminder šemu; endpoint vraća 503 dok kontrolisana migracija nije kompletna.
+7. Deploy-ovati novu verziju sa `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1`.
+   Sačekati završetak deploy-a i proveriti startup/smoke zahteve; tek tada
+   postaviti varijablu na `0` i izvršiti još jedan deploy istog SHA. Stari
+   procesi ostaju blokirani database guard-om čak i dok se gase. `init_db()` na
+   postojećoj bazi više ne sme napraviti reminder šemu; endpoint vraća 503 dok
+   kontrolisana migracija nije kompletna.
 8. Ponovo uključiti cron tek posle uspešnog `--check`. Pozvati ga sa
    testnom/staging bazom i mock Brevo kredencijalima, zatim u produkciji proveriti
    samo logove i redove `reminder_events` bez slanja test poruka stvarnim primaocima.

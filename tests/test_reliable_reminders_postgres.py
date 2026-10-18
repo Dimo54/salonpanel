@@ -24,6 +24,7 @@ APPROVED_TEST_DATABASES = frozenset({
     "salonpanel_reminders_test",
     "salonpanel_reminders_final_test",
     "salonpanel_reminders_legacy_past_test",
+    "salonpanel_reminders_write_freeze_test",
 })
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 LOCAL_TEST_PORT = 55432
@@ -183,6 +184,11 @@ class ReliableReminderPostgresTests(unittest.TestCase):
         new_date = rescheduled_at.date()
         new_time = rescheduled_at.time()
         with self.connection.cursor() as cur:
+            # This is what the freeze-aware deployed application does after
+            # the operator turns the public write freeze off.
+            cur.execute(
+                "SELECT set_config('salonpanel.appointment_write_freeze_bypass', 'on', false)"
+            )
             # This is the production schedule-version transition expressed
             # against a real migrated PostgreSQL row.
             cur.execute("""
@@ -201,6 +207,82 @@ class ReliableReminderPostgresTests(unittest.TestCase):
         with self.connection.cursor() as cur:
             cur.execute("SELECT schedule_version, schedule_started_at FROM appointments WHERE id = 10")
             self.assertEqual(cur.fetchone(), (2, rescheduled_at))
+
+    def test_legacy_past_only_database_guard_blocks_old_code_and_allows_new_code(self):
+        """A raw old-client connection cannot write during a Render overlap."""
+        self.apply("legacy-past-only")
+        with psycopg.connect(self.local_test_url) as old_client:
+            with old_client.cursor() as cur:
+                with self.assertRaises(psycopg.Error) as blocked:
+                    cur.execute(
+                        "INSERT INTO appointments (id, salon_id, created_at) "
+                        "VALUES (11, 1, CURRENT_TIMESTAMP)"
+                    )
+            self.assertEqual(blocked.exception.sqlstate, "55000")
+            old_client.rollback()
+
+        with psycopg.connect(self.local_test_url) as freeze_aware_client:
+            with freeze_aware_client.cursor() as cur:
+                cur.execute(
+                    "SELECT set_config('salonpanel.appointment_write_freeze_bypass', 'on', false)"
+                )
+                cur.execute(
+                    "INSERT INTO appointments (id, salon_id, created_at) "
+                    "VALUES (11, 1, CURRENT_TIMESTAMP)"
+                )
+            freeze_aware_client.commit()
+        with self.connection.cursor() as cur:
+            cur.execute("SELECT count(*) FROM appointments WHERE id = 11")
+            self.assertEqual(cur.fetchone()[0], 1)
+
+    def test_new_application_connection_keeps_database_guard_while_freeze_is_on(self):
+        self.apply("legacy-past-only")
+        with patch.dict(
+            os.environ,
+            {
+                "DATABASE_URL": self.local_test_url,
+                "SALONPANEL_APPOINTMENT_WRITE_FREEZE": "1",
+            },
+            clear=False,
+        ):
+            with salon_app.app.app_context():
+                connection = salon_app.get_db()
+                with connection.cursor() as cur:
+                    with self.assertRaises(psycopg.Error) as blocked:
+                        cur.execute(
+                            "INSERT INTO appointments (id, salon_id, created_at) "
+                            "VALUES (11, 1, CURRENT_TIMESTAMP)"
+                        )
+                    self.assertEqual(blocked.exception.sqlstate, "55000")
+                connection.rollback()
+
+    def test_legacy_past_only_database_guard_rejects_parallel_old_writers(self):
+        """No overlapping old process can slip an appointment through the guard."""
+        self.apply("legacy-past-only")
+        start = threading.Barrier(2, timeout=5)
+
+        def old_write(appointment_id):
+            with psycopg.connect(self.local_test_url) as connection:
+                with connection.cursor() as cur:
+                    cur.execute("SET statement_timeout = '5s'")
+                    start.wait(timeout=5)
+                    try:
+                        cur.execute(
+                            "INSERT INTO appointments (id, salon_id, created_at) "
+                            "VALUES (%s, 1, CURRENT_TIMESTAMP)",
+                            (appointment_id,),
+                        )
+                    except psycopg.Error as error:
+                        return error.sqlstate
+            return None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(old_write, appointment_id) for appointment_id in (11, 12)]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual(results, ["55000", "55000"])
+        with self.connection.cursor() as cur:
+            cur.execute("SELECT count(*) FROM appointments WHERE id IN (11, 12)")
+            self.assertEqual(cur.fetchone()[0], 0)
 
     def test_legacy_past_only_lock_blocks_concurrent_appointment_insert(self):
         """The migration's table lock rejects concurrent appointment writes."""

@@ -151,6 +151,19 @@ class ReliableReminderTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         send.assert_not_called()
 
+    def test_appointment_write_freeze_rejects_persist_before_any_database_work(self):
+        with (
+            patch.dict(os.environ, {"SALONPANEL_APPOINTMENT_WRITE_FREEZE": "1"}, clear=False),
+            patch.object(salon_app, "get_db") as get_db,
+        ):
+            appointment_id, error = salon_app.persist_appointment_locked(
+                {"id": 1}, 2, 3, self.now.date(), self.now.time(), 30, 1000,
+                "scheduled", "admin", "",
+            )
+        self.assertIsNone(appointment_id)
+        self.assertEqual(error, salon_app.APPOINTMENT_WRITE_FREEZE_MESSAGE)
+        get_db.assert_not_called()
+
     def test_schema_with_missing_reminder_unique_constraint_refuses_cron(self):
         with (
             patch.dict(os.environ, {"REMINDER_SECRET": "test-reminder-secret"}, clear=False),

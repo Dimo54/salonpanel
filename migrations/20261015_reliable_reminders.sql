@@ -118,4 +118,36 @@ WHERE e.successful = TRUE
   AND a.salon_id IS NOT NULL
 ON CONFLICT (appointment_id, reminder_type, schedule_version) DO NOTHING;
 
+-- `legacy-past-only` deliberately avoids inferring historical created_at
+-- semantics. Once its transaction commits, an unmodified old application
+-- could otherwise create a future appointment before the freeze-aware code is
+-- live. Keep a database-enforced gate in place: only a freeze-aware process
+-- explicitly setting this session GUC may mutate appointments. This also
+-- protects the Render old/new overlap; it is not an authorization mechanism.
+DO $$
+BEGIN
+    IF current_setting('salonpanel.history_timestamp_convention', true) = 'legacy-past-only' THEN
+        CREATE OR REPLACE FUNCTION public.salonpanel_enforce_appointment_write_freeze()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        BEGIN
+            IF current_setting('salonpanel.appointment_write_freeze_bypass', true) IS DISTINCT FROM 'on' THEN
+                RAISE EXCEPTION 'appointment writes are frozen pending the freeze-aware deployment'
+                    USING ERRCODE = '55000';
+            END IF;
+            IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+            END IF;
+            RETURN NEW;
+        END;
+        $function$;
+
+        DROP TRIGGER IF EXISTS salonpanel_appointment_write_freeze ON public.appointments;
+        CREATE TRIGGER salonpanel_appointment_write_freeze
+        BEFORE INSERT OR UPDATE OR DELETE ON public.appointments
+        FOR EACH ROW EXECUTE FUNCTION public.salonpanel_enforce_appointment_write_freeze();
+    END IF;
+END $$;
+
 COMMIT;
