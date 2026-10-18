@@ -119,8 +119,13 @@ izričite odluke u rollout koraku.
 8. Ponovo uključiti cron tek posle uspešnog `--check`. Pozvati ga sa
    testnom/staging bazom i mock Brevo kredencijalima, zatim u produkciji proveriti
    samo logove i redove `reminder_events` bez slanja test poruka stvarnim primaocima.
-9. Za rollback zaustaviti novi cron, vratiti prethodni kod, pa uključiti stari
-   cron. Ne brisati nove kolone/tabelu: dual-write uspeha čuva staru deduplikaciju.
+9. Za rollback zaustaviti novi cron i ne vraćati sirovi `a8fa83d` ako je
+   korišćen `legacy-past-only`: njegov kod ne može proći persistent appointment
+   write guard. Vratiti samo pripremljenu freeze-aware kompatibilnu reviziju uz
+   `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1`, zadržati nove kolone/tabelu i
+   proveriti legacy evidenciju pre bilo kakvog ponovnog uključivanja crona.
+   Stari kod ne povećava `schedule_version` pri pomeranju termina, pa se
+   scheduling ne odmrzava bez eksplicitne procene tog rizika.
 
 Rezervacija pre poziva Brevo-u sprečava paralelne cron duplikate i omogućava
 ograničene retry-je posle istekle rezervacije. Potpuni exactly-once email ipak
