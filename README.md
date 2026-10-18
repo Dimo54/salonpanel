@@ -92,11 +92,13 @@ izričite odluke u rollout koraku.
    zato postavlja database-level write guard: neizmenjeni stari proces ne može
    da INSERT/UPDATE/DELETE-uje `appointments` ni posle commita, uključujući
    Render old/new overlap. Nova aplikacija propušta guard samo kada je
-   `SALONPANEL_APPOINTMENT_WRITE_FREEZE` eksplicitno isključen. Pre migracije
-   deploy-ovati freeze-aware kompatibilnu reviziju, postaviti varijablu na `1`,
-   sačekati da Render završi deploy i proveriti odbijanje booking/status/delete
-   zahteva. Cron mora ostati zaustavljen. Ne tretirati samu izmenu Render env
-   varijable kao trenutnu promenu već pokrenutog procesa.
+   `SALONPANEL_APPOINTMENT_WRITE_FREEZE` eksplicitno isključen. Nije potreban
+   pre-migration deploy samo radi freeze-a: lock čeka postojeće upise, zatim
+   transakcija ponavlja past-only proveru i tek na commitu uključuje guard.
+   Pre novog deploy-a postaviti varijablu na `1`; stari kod je ignoriše, ali je
+   guard već blokirao njegove appointment upise. Cron mora ostati zaustavljen.
+   Ne tretirati samu izmenu Render env varijable kao trenutnu promenu već
+   pokrenutog procesa.
 5. Iz kontrolisanog operator okruženja uraditi dry-run, zatim `--apply` sa
    tačnim `--expected-database`, `--expected-timezone`, deklarisanom
    `--history-timestamp-convention` i potvrdom oblika

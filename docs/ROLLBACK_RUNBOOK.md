@@ -67,16 +67,17 @@ appointments are not reminder-due; a later date/time move by the new code
 increments `schedule_version` and writes a fresh local `schedule_started_at`.
 
 This exception requires a maintenance window: pause the old reminder cron and
-set `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1` on the prepared freeze-aware
-compatibility deployment before migration. Confirm actual booking/status/delete
-rejection after the Render deploy completes; changing an env value alone does
-not modify a running process. The migration then installs a persistent
-database-level `appointments` write guard. Raw old application connections have
-no bypass setting and remain rejected after commit, including during a Render
-old/new overlap. Deploy the new revision with the flag still `1`; after startup
-and post-migration checks, set it to `0` and redeploy that same SHA. A
-freeze-aware connection is the only process that can then write appointments.
-If any of these checks cannot be verified, do not use `legacy-past-only`.
+set `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1` before the new-code deploy. The
+migration itself acquires write-blocking locks, repeats the past-only check
+after existing writers have drained, and installs a persistent database-level
+`appointments` write guard at commit. Therefore a pre-migration compatibility
+deploy is not required for safety: a raw old connection has no bypass setting
+and remains rejected after commit, including during a Render old/new overlap.
+Deploy the new revision with the flag still `1`; after startup and
+post-migration checks, set it to `0` and redeploy that same SHA. A freeze-aware
+connection is the only process that can then write appointments. Changing an
+env value alone does not modify an already running process. If any of these
+checks cannot be verified, do not use `legacy-past-only`.
 
 Rollback is complete only when the prior revision is confirmed live, smoke tests pass, billing changes are paused or safe, logs contain no sensitive data, and the incident record includes the deployed SHA and remaining follow-up.
 
