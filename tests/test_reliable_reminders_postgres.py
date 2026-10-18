@@ -25,6 +25,7 @@ APPROVED_TEST_DATABASES = frozenset({
     "salonpanel_reminders_final_test",
     "salonpanel_reminders_legacy_past_test",
     "salonpanel_reminders_write_freeze_test",
+    "salonpanel_reminders_final_integration_test",
 })
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 LOCAL_TEST_PORT = 55432
