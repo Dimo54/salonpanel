@@ -4,6 +4,7 @@ Set SALONPANEL_TEST_DATABASE_URL to one of the dedicated empty local databases
 listed in APPROVED_TEST_DATABASES. This module never falls back to DATABASE_URL.
 """
 import os
+import sys
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, time, timedelta
@@ -14,6 +15,10 @@ from unittest.mock import patch
 import threading
 
 import psycopg
+
+SCRIPTS_DIRECTORY = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIRECTORY))
+import run_reminder_migrations
 
 os.environ.setdefault("SALONPANEL_SKIP_DB_INIT", "1")
 import app as salon_app
@@ -26,6 +31,7 @@ APPROVED_TEST_DATABASES = frozenset({
     "salonpanel_reminders_legacy_past_test",
     "salonpanel_reminders_write_freeze_test",
     "salonpanel_reminders_final_integration_test",
+    "salonpanel_reminders_timezone_test",
 })
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 LOCAL_TEST_PORT = 55432
@@ -137,6 +143,37 @@ class ReliableReminderPostgresTests(unittest.TestCase):
             self.assertEqual(cur.fetchone(), (datetime(2029, 1, 2, 8, 30), 1))
             cur.execute("SELECT salon_id, appointment_id, reminder_type, state FROM reminder_events")
             self.assertEqual(cur.fetchall(), [(1, 10, "reminder_24h", "successful")])
+
+    def test_runner_explicit_timezone_setup_works_when_pgoptions_are_ignored(self):
+        environment = run_reminder_migrations.connection_environment(
+            self.local_test_url,
+            "Europe/Belgrade",
+        )
+        # Simulate a transaction pooler that discarded the startup PGOPTIONS.
+        environment["PGOPTIONS"] = ""
+        completed = run_reminder_migrations.run_psql(
+            environment,
+            "Europe/Belgrade",
+            "--tuples-only",
+            "--no-align",
+            "--field-separator=|",
+            "--command",
+            "SELECT current_database(), current_setting('TimeZone'), CURRENT_DATE",
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        database, timezone, current_date = completed.stdout.strip().split("|")
+        self.assertEqual(database, self.test_database)
+        self.assertEqual(timezone, "Europe/Belgrade")
+        self.assertEqual(current_date, datetime.now(salon_app.ZoneInfo("Europe/Belgrade")).date().isoformat())
+        accepted, _ = run_reminder_migrations.target_confirmation(
+            environment,
+            self.test_database,
+            "127.0.0.1",
+            55432,
+            "Europe/Belgrade",
+        )
+        self.assertTrue(accepted)
 
     def test_utc_history_is_converted_to_belgrade_wall_clock(self):
         with self.connection.cursor() as cur:

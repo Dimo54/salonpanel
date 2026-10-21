@@ -80,12 +80,50 @@ class MigrationToolingTests(unittest.TestCase):
     def test_reminder_runner_keeps_database_url_out_of_psql_argv(self):
         url = "postgresql://user:private-password@localhost:5433/salonpanel_reminders_test?sslmode=require"
         environment = run_reminder_migrations.connection_environment(url, "Europe/Belgrade", "utc")
-        command = run_reminder_migrations.psql_command("--command", "SELECT 1")
+        command = run_reminder_migrations.psql_command("Europe/Belgrade", "--command", "SELECT 1")
         self.assertNotIn(url, command)
         self.assertNotIn("private-password", " ".join(command))
         self.assertEqual(environment["PGDATABASE"], "salonpanel_reminders_test")
         self.assertEqual(environment["PGSSLMODE"], "require")
         self.assertIn("history_timestamp_convention=utc", environment["PGOPTIONS"])
+        self.assertEqual(command[command.index("--command"):command.index("--command") + 2],
+                         ["--command", "SET TIME ZONE 'Europe/Belgrade'"])
+        self.assertIn("--quiet", command)
+
+    def test_reminder_runner_explicitly_sets_timezone_when_pooler_ignores_pgoptions(self):
+        environment = run_reminder_migrations.connection_environment(
+            "postgresql://user:password@db.example.com:5432/salon?sslmode=require",
+            "Europe/Belgrade",
+            "legacy-past-only",
+        )
+        self.assertIn("TimeZone=Europe/Belgrade", environment["PGOPTIONS"])
+        command = run_reminder_migrations.psql_command(
+            "Europe/Belgrade",
+            "--file",
+            "migration.sql",
+            history_convention="legacy-past-only",
+        )
+        setup = command[command.index("--command") + 1]
+        self.assertIn("SET TIME ZONE 'Europe/Belgrade'", setup)
+        self.assertIn("salonpanel.history_timestamp_convention", setup)
+        self.assertLess(command.index("--command"), command.index("--file"))
+
+    def test_reminder_runner_rejects_invalid_timezone_before_psql_or_migration(self):
+        with (
+            patch.dict(os.environ, {"DATABASE_URL": "postgresql://user:password@db.example.com:5432/salon?sslmode=require"}, clear=True),
+            patch.object(run_reminder_migrations.shutil, "which", return_value="/usr/bin/psql"),
+            patch.object(run_reminder_migrations.subprocess, "run") as run,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            result = run_reminder_migrations.main([
+                "--apply", "--environment", "production", "--expected-database", "salon",
+                "--expected-host", "db.example.com", "--expected-port", "5432",
+                "--expected-timezone", "Invalid/Timezone",
+                "--history-timestamp-convention", "legacy-past-only",
+                "--confirm-target", "APPLY-REMINDER-MIGRATIONS:production:salon",
+            ])
+        self.assertEqual(result, 2)
+        run.assert_not_called()
 
     def test_reminder_runner_allows_explicit_legacy_past_only_convention(self):
         environment = run_reminder_migrations.connection_environment(
@@ -114,6 +152,7 @@ class MigrationToolingTests(unittest.TestCase):
         with patch.dict(os.environ, {
             "PGHOSTADDR": "203.0.113.9", "PGSERVICE": "unsafe", "PGSERVICEFILE": "/tmp/unsafe",
             "PGSSLMODE": "disable", "PGOPTIONS": "-c search_path=unsafe",
+            "DATABASE_URL": "postgresql://inherited:unsafe@ignored.example/ignored",
         }, clear=False):
             environment = run_reminder_migrations.connection_environment(
                 "postgresql://user:password@db.example.com:5432/salon?sslmode=verify-full",
@@ -121,6 +160,7 @@ class MigrationToolingTests(unittest.TestCase):
             )
         for name in ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"):
             self.assertNotIn(name, environment)
+        self.assertNotIn("DATABASE_URL", environment)
         self.assertEqual(environment["PGHOST"], "db.example.com")
         self.assertEqual(environment["PGPORT"], "5432")
         self.assertEqual(environment["PGSSLMODE"], "verify-full")
@@ -171,9 +211,10 @@ class MigrationToolingTests(unittest.TestCase):
                 environment, "salonpanel_reminders_runner_backup", "127.0.0.1", 55432, "Europe/Belgrade",
             )
         self.assertTrue(accepted)
-        command = run.call_args.args[1:]
+        command = run.call_args.args[2:]
         self.assertNotIn("inet_server_addr", " ".join(command))
         self.assertNotIn("inet_server_port", " ".join(command))
+        self.assertEqual(run.call_args.args[1], "Europe/Belgrade")
 
     def test_reminder_target_confirmation_rejects_wrong_timezone_or_configured_endpoint(self):
         environment = run_reminder_migrations.connection_environment(

@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from urllib.parse import parse_qs, unquote, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from rollout_common import missing_reminder_migrations, reminder_migration_paths
 
@@ -67,6 +68,7 @@ def build_parser():
 
 def connection_environment(database_url, expected_timezone, history_convention=None):
     """Convert DATABASE_URL to libpq environment variables, never psql argv."""
+    validate_timezone(expected_timezone)
     parsed = urlsplit(database_url)
     if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname or not parsed.path.strip("/"):
         raise ValueError("DATABASE_URL is malformed")
@@ -87,7 +89,13 @@ def connection_environment(database_url, expected_timezone, history_convention=N
         sslmode = "require"
     # libpq honors many PG* variables. Remove every inherited one before
     # supplying the complete, parsed connection identity below.
-    environment = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
+    # DATABASE_URL is consumed here, not forwarded to the psql child.  The
+    # child only receives the parsed libpq variables below, so the complete
+    # credential-bearing URL cannot appear in its inherited environment.
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("PG") and key != "DATABASE_URL"
+    }
     environment.update({
         "PGHOST": parsed.hostname,
         "PGPORT": str(port),
@@ -104,12 +112,45 @@ def connection_environment(database_url, expected_timezone, history_convention=N
     return environment
 
 
-def psql_command(*arguments):
-    return ["psql", "-X", "--set=ON_ERROR_STOP=1", *arguments]
+def validate_timezone(expected_timezone):
+    try:
+        ZoneInfo(expected_timezone)
+    except (TypeError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("expected timezone is invalid") from exc
+    return expected_timezone
 
 
-def run_psql(environment, *arguments, capture_output=False):
-    return subprocess.run(psql_command(*arguments), check=False, shell=False, env=environment,
+def sql_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def session_setup_sql(expected_timezone, history_convention=None):
+    """Set rollout session state explicitly; poolers may discard PGOPTIONS."""
+    timezone = validate_timezone(expected_timezone)
+    statements = [f"SET TIME ZONE {sql_literal(timezone)}"]
+    if history_convention:
+        statements.append(
+            "SELECT set_config('salonpanel.history_timestamp_convention', "
+            f"{sql_literal(history_convention)}, false)"
+        )
+    return "; ".join(statements)
+
+
+def psql_command(expected_timezone, *arguments, history_convention=None):
+    # `--command` and `--file` are handled by one psql process/connection.
+    # With ON_ERROR_STOP, a failed SET prevents the subsequent migration file.
+    return [
+        # Suppress the `SET` command tag so captured target/check output is
+        # solely the explicitly requested query result.
+        "psql", "-X", "--quiet", "--set=ON_ERROR_STOP=1",
+        "--command", session_setup_sql(expected_timezone, history_convention),
+        *arguments,
+    ]
+
+
+def run_psql(environment, expected_timezone, *arguments, history_convention=None, capture_output=False):
+    return subprocess.run(psql_command(expected_timezone, *arguments, history_convention=history_convention),
+                          check=False, shell=False, env=environment,
                           capture_output=capture_output, text=True)
 
 
@@ -120,7 +161,7 @@ def target_confirmation(environment, expected_database, expected_host, expected_
     network namespace, not the NAT-facing host/port that libpq contacted.
     They therefore cannot validate a Docker-published client endpoint.
     """
-    completed = run_psql(environment, "--tuples-only", "--no-align", "--field-separator=|",
+    completed = run_psql(environment, expected_timezone, "--tuples-only", "--no-align", "--field-separator=|",
                          "--command", "SELECT current_database(), current_setting('TimeZone')", capture_output=True)
     if completed.returncode:
         return False, "Target identity check failed; connection details were suppressed."
@@ -176,7 +217,7 @@ def main(argv=None):
         print(message, file=sys.stderr)
         return 1
     if args.check:
-        completed = run_psql(environment, "--tuples-only", "--no-align", "--field-separator=|", "--command", CHECK_SQL, capture_output=True)
+        completed = run_psql(environment, args.expected_timezone, "--tuples-only", "--no-align", "--field-separator=|", "--command", CHECK_SQL, capture_output=True)
         values = completed.stdout.strip().split("|") if not completed.returncode else []
         if len(values) != 8 or values[0] != args.expected_database or values[1] != args.expected_timezone or any(value != "t" for value in values[2:]):
             print("Reminder migration check failed; schema, backfill, target, or timezone is incomplete.", file=sys.stderr)
@@ -184,7 +225,13 @@ def main(argv=None):
         print("Schema check: PASS")
         return 0
     for path in reminder_migration_paths():
-        completed = run_psql(environment, "--file", str(path))
+        completed = run_psql(
+            environment,
+            args.expected_timezone,
+            "--file",
+            str(path),
+            history_convention=args.history_timestamp_convention,
+        )
         if completed.returncode:
             print(f"Migration failed: {path.name}; database diagnostics were suppressed.", file=sys.stderr)
             return 1
