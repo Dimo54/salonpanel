@@ -79,8 +79,16 @@ PADDLE_SUBSCRIPTION_EVENT_TYPES = frozenset(
 )
 BOOKING_SLOT_MINUTES = 10
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+REMINDER_SCHEDULE_VERSION = 1
+REMINDER_LEASE_MINUTES = 10
+REMINDER_MAX_ATTEMPTS = 3
+REMINDER_RETRY_DELAY_MINUTES = 10
 APPOINTMENT_WRITE_FREEZE_ENV = "SALONPANEL_APPOINTMENT_WRITE_FREEZE"
 APPOINTMENT_WRITE_FREEZE_MESSAGE = "Zakazivanje i izmene termina su privremeno obustavljeni."
+LEGACY_REMINDER_EVENT_KEYS = {
+    "reminder_24h": "reminder-24h",
+    "reminder_2h": "reminder-2h",
+}
 
 app = Flask(__name__, instance_relative_config=True)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -206,8 +214,10 @@ def appointment_writes_frozen() -> bool:
 def get_db():
     if "db" not in g:
         connection = psycopg.connect(database_url(), row_factory=dict_row)
-        # The later reliable-reminder migration recognizes this session GUC.
-        # A raw a8fa83d process cannot opt into appointment writes.
+        # The legacy-past-only migration installs a database-level appointment
+        # guard. Only a post-migration, freeze-aware application process may
+        # opt into writes; an a8fa83d process does not know this session GUC and
+        # stays blocked even during a zero-downtime deployment overlap.
         if not appointment_writes_frozen():
             with connection.cursor() as cur:
                 cur.execute(
@@ -248,6 +258,12 @@ def db_execute_many(query, rows):
     with get_db().cursor() as cur:
         cur.executemany(query, rows)
     get_db().commit()
+
+
+def rollback_current_db():
+    """Rollback only an already-open request connection."""
+    if "db" in g:
+        g.db.rollback()
 
 
 class SalonNotFoundError(Exception):
@@ -305,7 +321,28 @@ def local_today():
     return local_now().date()
 
 
+def reminder_wall_clock(value=None):
+    """Return the naive local form used by reminder TIMESTAMP columns.
+
+    Reminder schedule values model salon-local wall time; provider instants use
+    TIMESTAMPTZ elsewhere. Never let a PostgreSQL session reinterpret an aware
+    datetime while inserting it into these timestamp-without-time-zone fields.
+    """
+    instant = value or local_now()
+    if instant.tzinfo is None:
+        return instant
+    try:
+        return instant.astimezone(ZoneInfo(APP_TIMEZONE)).replace(tzinfo=None)
+    except Exception:
+        return instant.replace(tzinfo=None)
+
+
 def init_db():
+    # `init_db` predates controlled migrations.  It may create the complete
+    # reminder schema only for an empty database; altering a live database here
+    # would skip the historical backfill in the checked migration.
+    existing_appointments = db_query("SELECT to_regclass('public.appointments') AS name", one=True)
+    is_new_database = not existing_appointments or not existing_appointments.get("name")
     schema = """
     CREATE TABLE IF NOT EXISTS salons (
         id SERIAL PRIMARY KEY,
@@ -429,7 +466,9 @@ def init_db():
         notes TEXT,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        public_token TEXT
+        public_token TEXT,
+        schedule_version INTEGER NOT NULL DEFAULT 1,
+        schedule_started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS subscription_events (
@@ -563,6 +602,29 @@ def init_db():
             SET duration_minutes = s.duration_minutes
             FROM services s
             WHERE a.service_id = s.id AND a.worker_id IS NULL
+        """)
+    if is_new_database:
+        # A genuinely new database has no history to backfill.  Existing
+        # installations must use the versioned migration instead.
+        db_execute("""
+            CREATE TABLE IF NOT EXISTS reminder_events (
+                id BIGSERIAL PRIMARY KEY,
+                salon_id INTEGER NOT NULL REFERENCES salons(id) ON DELETE CASCADE,
+                appointment_id INTEGER NOT NULL REFERENCES appointments(id) ON DELETE CASCADE,
+                reminder_type TEXT NOT NULL CHECK (reminder_type IN ('reminder_24h', 'reminder_2h')),
+                schedule_version INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('processing', 'successful', 'failed', 'skipped')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMP,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                sent_at TIMESTAMP,
+                UNIQUE (appointment_id, reminder_type, schedule_version)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reminder_events_retry
+                ON reminder_events(state, lease_expires_at);
         """)
     ensure_default_workers()
     ensure_all_working_hours()
@@ -2003,7 +2065,9 @@ def persist_appointment_locked(
                     connection.rollback()
                     return None, error
 
-            now = datetime.now()
+            # Appointment dates/times are local wall-clock values; keep the
+            # scheduling timestamp in the same convention.
+            now = local_now().replace(tzinfo=None)
             if appointment_id:
                 if client_id is None:
                     connection.rollback()
@@ -2015,7 +2079,13 @@ def persist_appointment_locked(
                         SET client_id = %s, service_id = %s, worker_id = %s, date = %s, time = %s,
                             duration_minutes = %s, price = %s, status = %s, notes = %s,
                             contact_name = %s, contact_phone = %s, contact_phone_normalized = %s,
-                            contact_email = %s, contact_source = %s, updated_at = %s
+                            contact_email = %s, contact_source = %s, updated_at = %s,
+                            schedule_version = CASE WHEN date IS DISTINCT FROM %s OR time IS DISTINCT FROM %s
+                                OR (status IS DISTINCT FROM 'scheduled' AND %s = 'scheduled')
+                                THEN schedule_version + 1 ELSE schedule_version END,
+                            schedule_started_at = CASE WHEN date IS DISTINCT FROM %s OR time IS DISTINCT FROM %s
+                                OR (status IS DISTINCT FROM 'scheduled' AND %s = 'scheduled')
+                                THEN %s ELSE schedule_started_at END
                         WHERE id = %s AND salon_id = %s
                         RETURNING id
                         """,
@@ -2035,6 +2105,13 @@ def persist_appointment_locked(
                             contact_email,
                             contact_source,
                             now,
+                            appointment_date,
+                            appointment_time,
+                            status,
+                            appointment_date,
+                            appointment_time,
+                            status,
+                            now,
                             appointment_id,
                             salon["id"],
                         ),
@@ -2044,7 +2121,13 @@ def persist_appointment_locked(
                         """
                         UPDATE appointments
                         SET client_id = %s, service_id = %s, worker_id = %s, date = %s, time = %s,
-                            duration_minutes = %s, price = %s, status = %s, notes = %s, updated_at = %s
+                            duration_minutes = %s, price = %s, status = %s, notes = %s, updated_at = %s,
+                            schedule_version = CASE WHEN date IS DISTINCT FROM %s OR time IS DISTINCT FROM %s
+                                OR (status IS DISTINCT FROM 'scheduled' AND %s = 'scheduled')
+                                THEN schedule_version + 1 ELSE schedule_version END,
+                            schedule_started_at = CASE WHEN date IS DISTINCT FROM %s OR time IS DISTINCT FROM %s
+                                OR (status IS DISTINCT FROM 'scheduled' AND %s = 'scheduled')
+                                THEN %s ELSE schedule_started_at END
                         WHERE id = %s AND salon_id = %s
                         RETURNING id
                         """,
@@ -2058,6 +2141,13 @@ def persist_appointment_locked(
                             price,
                             status,
                             notes,
+                            now,
+                            appointment_date,
+                            appointment_time,
+                            status,
+                            appointment_date,
+                            appointment_time,
+                            status,
                             now,
                             appointment_id,
                             salon["id"],
@@ -2085,9 +2175,10 @@ def persist_appointment_locked(
                         (salon_id, client_id, service_id, worker_id, date, time, duration_minutes,
                          price, status, source, notes, created_at, updated_at, public_token,
                          contact_name, contact_phone, contact_phone_normalized, contact_email,
-                         contact_source, privacy_consent_at, marketing_consent)
+                         contact_source, privacy_consent_at, marketing_consent,
+                         schedule_version, schedule_started_at)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s)
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
@@ -2112,6 +2203,8 @@ def persist_appointment_locked(
                         contact_source,
                         now if privacy_consent else None,
                         bool(marketing_consent),
+                        REMINDER_SCHEDULE_VERSION,
+                        now,
                     ),
                 )
             row = cur.fetchone()
@@ -2831,6 +2924,241 @@ def send_appointment_event(appointment_id, salon_id, event_key, message_type, on
         app.logger.exception("Upis email dogadjaja nije uspeo")
         get_db().rollback()
     return sent, error
+
+
+def appointment_start_at(appointment, tzinfo):
+    """Return the local start time for an appointment row, or None for bad data."""
+    start_minutes = time_to_minutes(appointment.get("time"))
+    appointment_date = parse_iso_date(appointment.get("date"))
+    if start_minutes is None or not appointment_date:
+        return None
+    return datetime.combine(
+        appointment_date,
+        time(start_minutes // 60, start_minutes % 60),
+        tzinfo=tzinfo,
+    )
+
+
+def due_reminder_type(appointment, now):
+    """Choose the one reminder that is currently useful for this schedule version.
+
+    A 24h reminder is intentionally skipped when the schedule was first created
+    inside its 24-hour window.  Sending "tomorrow" for a newly booked near-term
+    appointment is misleading; its 2h reminder remains eligible.
+    """
+    if appointment.get("status") != "scheduled":
+        return None
+    appointment_start = appointment_start_at(appointment, now.tzinfo)
+    if not appointment_start:
+        return None
+    minutes_until = (appointment_start - now).total_seconds() / 60
+    if 0 < minutes_until <= 120:
+        return "reminder_2h"
+    if 120 < minutes_until <= 24 * 60:
+        scheduled_at = appointment.get("schedule_started_at")
+        if scheduled_at is None:
+            return None
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=now.tzinfo)
+        if scheduled_at <= appointment_start - timedelta(hours=24):
+            return "reminder_24h"
+    return None
+
+
+def reminder_schema_ready():
+    """Return whether the controlled reminder migration has completed.
+
+    This deliberately checks the backfill-bearing columns and table instead of
+    allowing the legacy startup schema helper to construct a partial rollout.
+    """
+    try:
+        row = db_query(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'appointments'
+                  AND column_name = 'schedule_version' AND data_type = 'integer'
+                  AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'appointments'
+                  AND column_name = 'schedule_started_at'
+                  AND data_type = 'timestamp without time zone' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'salon_id' AND data_type = 'integer' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'appointment_id' AND data_type = 'integer' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'reminder_type' AND data_type = 'text' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'schedule_version' AND data_type = 'integer' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'state' AND data_type = 'text' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'attempt_count' AND data_type = 'integer' AND is_nullable = 'NO'
+            ) AND EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'reminder_events'
+                  AND column_name = 'lease_expires_at' AND data_type = 'timestamp without time zone'
+            ) AND EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = to_regclass('public.reminder_events') AND contype = 'u'
+                  AND pg_get_constraintdef(oid) LIKE '%%UNIQUE (appointment_id, reminder_type, schedule_version)%%'
+            ) AND EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = 'reminder_events'
+                  AND indexname = 'idx_reminder_events_retry'
+            ) AS ready
+            """,
+            one=True,
+        )
+        return bool(row and row.get("ready"))
+    except Exception:
+        app.logger.exception("Provera reminder seme nije uspela")
+        rollback_current_db()
+        return False
+
+
+def legacy_reminder_successful(appointment_id, reminder_type, schedule_version):
+    """Old idempotency has no schedule version, so it applies to v1 only."""
+    if schedule_version != 1:
+        return False
+    event_key = LEGACY_REMINDER_EVENT_KEYS[reminder_type]
+    return bool(db_query(
+        """SELECT 1 FROM email_events
+           WHERE appointment_id = %s AND event_key = %s AND successful = TRUE""",
+        (appointment_id, event_key), one=True,
+    ))
+
+
+def record_legacy_reminder_success(appointment_id, salon_id, reminder_type, recipient, now):
+    """Dual-write successful deliveries so a code rollback keeps old dedupe."""
+    now = reminder_wall_clock(now)
+    db_execute(
+        """
+        INSERT INTO email_events
+            (salon_id, appointment_id, event_key, recipient, successful, error_message, created_at)
+        VALUES (%s, %s, %s, %s, TRUE, '', %s)
+        ON CONFLICT (appointment_id, event_key)
+        DO UPDATE SET salon_id = EXCLUDED.salon_id, recipient = EXCLUDED.recipient,
+                      successful = TRUE, error_message = '', created_at = EXCLUDED.created_at
+        """,
+        (salon_id, appointment_id, LEGACY_REMINDER_EVENT_KEYS[reminder_type], recipient or "", now),
+    )
+
+
+def finish_successful_reminder_claim(appointment_id, salon_id, reminder_type, schedule_version, lease_token, recipient, now):
+    """Atomically persist new and legacy success records on one connection."""
+    now = reminder_wall_clock(now)
+    connection = get_db()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE reminder_events
+                SET state = 'successful', last_error = '', updated_at = %s, sent_at = %s,
+                    lease_token = NULL, lease_expires_at = NULL
+                WHERE appointment_id = %s AND reminder_type = %s AND schedule_version = %s
+                  AND state = 'processing' AND lease_token = %s
+                """,
+                (now, now, appointment_id, reminder_type, schedule_version, lease_token),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("Reminder claim vise nije u vlasnistvu radnika.")
+            cur.execute(
+                """
+                INSERT INTO email_events
+                    (salon_id, appointment_id, event_key, recipient, successful, error_message, created_at)
+                VALUES (%s, %s, %s, %s, TRUE, '', %s)
+                ON CONFLICT (appointment_id, event_key)
+                DO UPDATE SET salon_id = EXCLUDED.salon_id, recipient = EXCLUDED.recipient,
+                              successful = TRUE, error_message = '', created_at = EXCLUDED.created_at
+                """,
+                (salon_id, appointment_id, LEGACY_REMINDER_EVENT_KEYS[reminder_type], recipient or "", now),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def claim_reminder(appointment_id, salon_id, reminder_type, schedule_version, now):
+    """Atomically reserve one delivery attempt without holding a network transaction."""
+    now = reminder_wall_clock(now)
+    lease_token = secrets.token_urlsafe(24)
+    lease_expires_at = now + timedelta(minutes=REMINDER_LEASE_MINUTES)
+    try:
+        row = db_execute(
+            """
+            INSERT INTO reminder_events
+                (salon_id, appointment_id, reminder_type, schedule_version, state,
+                 attempt_count, lease_token, lease_expires_at, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 'processing', 1, %s, %s, %s, %s)
+            ON CONFLICT (appointment_id, reminder_type, schedule_version)
+            DO UPDATE SET state = 'processing', attempt_count = reminder_events.attempt_count + 1,
+                          lease_token = EXCLUDED.lease_token,
+                          lease_expires_at = EXCLUDED.lease_expires_at,
+                          updated_at = EXCLUDED.updated_at, last_error = ''
+            WHERE reminder_events.attempt_count < %s
+              AND ((reminder_events.state = 'failed'
+                    AND reminder_events.updated_at < %s)
+                   OR (reminder_events.state = 'processing'
+                       AND reminder_events.lease_expires_at < %s))
+            RETURNING id, lease_token
+            """,
+            (salon_id, appointment_id, reminder_type, schedule_version, lease_token,
+             lease_expires_at, now, now, REMINDER_MAX_ATTEMPTS,
+             now - timedelta(minutes=REMINDER_RETRY_DELAY_MINUTES), now),
+            returning=True,
+        )
+        return lease_token if row and row.get("lease_token") == lease_token else None
+    except Exception:
+        app.logger.exception("Rezervacija podsetnika nije uspela")
+        get_db().rollback()
+        return None
+
+
+def finish_reminder_claim(appointment_id, reminder_type, schedule_version, lease_token, state, now, error=""):
+    """Record the result only for the worker that owns this lease."""
+    now = reminder_wall_clock(now)
+    db_execute(
+        """
+        UPDATE reminder_events
+        SET state = %s, last_error = %s, updated_at = %s,
+            sent_at = CASE WHEN %s = 'successful' THEN %s ELSE sent_at END,
+            lease_token = NULL, lease_expires_at = NULL
+        WHERE appointment_id = %s AND reminder_type = %s AND schedule_version = %s
+          AND state = 'processing' AND lease_token = %s
+        """,
+        (state, error or "", now, state, now, appointment_id, reminder_type,
+         schedule_version, lease_token),
+    )
+
+
+def reminder_still_due(appointment_id, salon_id, reminder_type, schedule_version, now):
+    """Re-read status and version immediately before handing work to Brevo."""
+    appointment = db_query(
+        """
+        SELECT id, salon_id, date, time, status, schedule_version, schedule_started_at
+        FROM appointments WHERE id = %s AND salon_id = %s
+        """,
+        (appointment_id, salon_id), one=True,
+    )
+    if not appointment or appointment.get("schedule_version") != schedule_version:
+        return False
+    return due_reminder_type(appointment, now) == reminder_type
 
 
 @app.route("/appointments/<int:appointment_id>/status", methods=["POST"])
@@ -4266,7 +4594,8 @@ def public_booking(slug):
 
     salon_id = salon["id"]
     if request.method == "POST":
-        # Reject before the rate-limit write and before contact/client work.
+        # Do this before the rate-limit write and before any contact/client
+        # work, so a frozen booking attempt has no partial application state.
         if appointment_writes_frozen():
             flash(APPOINTMENT_WRITE_FREEZE_MESSAGE, "error")
             return render_template("booking.html", **public_booking_context(salon, dict(request.form)))
@@ -4420,10 +4749,15 @@ def send_reminders_task():
     if not cron_secret or not supplied or not secrets.compare_digest(cron_secret, supplied):
         return jsonify({"ok": False, "error": "Nedozvoljen pristup."}), 403
 
+    if not reminder_schema_ready():
+        # Never infer historical delivery state from a partial startup schema.
+        return jsonify({"ok": False, "error": "Reminder migracija nije spremna."}), 503
+
     now = local_now()
     rows = db_query(
         """
-        SELECT a.id, a.salon_id, a.date, a.time
+        SELECT a.id, a.salon_id, a.date, a.time, a.status,
+               a.schedule_version, a.schedule_started_at
         FROM appointments a
         JOIN salons s ON s.id = a.salon_id
         WHERE a.status = 'scheduled'
@@ -4439,31 +4773,70 @@ def send_reminders_task():
     sent_count = 0
     failed_count = 0
     for row in rows:
-        start_minutes = time_to_minutes(row["time"])
-        if start_minutes is None:
-            continue
-        appointment_start = datetime.combine(
-            parse_iso_date(row["date"]),
-            time(start_minutes // 60, start_minutes % 60),
-            tzinfo=now.tzinfo,
-        )
-        minutes_until = (appointment_start - now).total_seconds() / 60
-        reminder = None
-        event_key = None
-        if 1425 <= minutes_until <= 1455:
-            reminder = "reminder_24h"
-            event_key = "reminder-24h"
-        elif 105 <= minutes_until <= 135:
-            reminder = "reminder_2h"
-            event_key = "reminder-2h"
-        if not reminder:
-            continue
-        sent, error = send_appointment_event(row["id"], row["salon_id"], event_key, reminder, once=True)
-        if sent:
-            sent_count += 1
-        else:
+        # Each database/network attempt receives a current clock reading: a
+        # slow provider call must not extend a later claim from cron-start.
+        attempt_now = local_now()
+        lease_token = None
+        provider_accepted = False
+        try:
+            reminder = due_reminder_type(row, attempt_now)
+            if not reminder:
+                continue
+            schedule_version = row["schedule_version"]
+            if legacy_reminder_successful(row["id"], reminder, schedule_version):
+                continue
+            lease_token = claim_reminder(
+                row["id"], row["salon_id"], reminder, schedule_version, attempt_now,
+            )
+            if not lease_token:
+                continue
+            if not reminder_still_due(
+                row["id"], row["salon_id"], reminder, schedule_version, local_now(),
+            ):
+                finish_reminder_claim(
+                    row["id"], reminder, schedule_version, lease_token, "skipped", local_now(),
+                    "Termin vise nije pogodan za podsetnik.",
+                )
+                continue
+            data = appointment_email_data(row["id"], row["salon_id"])
+            if not data or not (data.get("client_email") or "").strip():
+                finish_reminder_claim(
+                    row["id"], reminder, schedule_version, lease_token, "failed", local_now(),
+                    "Termin ili email adresa nisu dostupni.",
+                )
+                failed_count += 1
+                continue
+            sent, error = send_appointment_message(data, reminder)
+            finished_at = local_now()
+            if sent:
+                provider_accepted = True
+                # Keep the new and legacy idempotency records in one database
+                # transaction. A crash after provider acceptance still remains
+                # an unavoidable Brevo exactly-once risk (documented below).
+                finish_successful_reminder_claim(
+                    row["id"], row["salon_id"], reminder, schedule_version, lease_token,
+                    data.get("client_email"), finished_at,
+                )
+                sent_count += 1
+            else:
+                finish_reminder_claim(
+                    row["id"], reminder, schedule_version, lease_token, "failed", finished_at, error or "",
+                )
+                failed_count += 1
+                app.logger.warning("Podsetnik %s za termin %s nije poslat: %s", reminder, row["id"], error)
+        except Exception:
+            app.logger.exception("Obrada podsetnika za termin %s nije uspela", row.get("id"))
+            rollback_current_db()
             failed_count += 1
-            app.logger.warning("Podsetnik %s za termin %s nije poslat: %s", reminder, row["id"], error)
+            if lease_token and not provider_accepted:
+                try:
+                    finish_reminder_claim(
+                        row["id"], reminder, row["schedule_version"], lease_token,
+                        "failed", local_now(), "Neocekivana greska pri obradi podsetnika.",
+                    )
+                except Exception:
+                    app.logger.exception("Zavrsetak neuspelog reminder claim-a nije uspeo")
+                    rollback_current_db()
     return jsonify({"ok": True, "sent": sent_count, "failed": failed_count, "checked": len(rows)})
 
 

@@ -681,6 +681,7 @@ class SecurityTests(unittest.TestCase):
         secret = "cron-test-secret"
         with (
             patch.dict(salon_app.os.environ, {"CRON_SECRET": secret}),
+            patch.object(salon_app, "reminder_schema_ready", return_value=True),
             patch.object(salon_app, "db_query", return_value=[]) as db_query,
             patch.object(salon_app, "send_appointment_event") as send_event,
         ):
@@ -697,6 +698,7 @@ class SecurityTests(unittest.TestCase):
         secret = "reminder-test-secret"
         with (
             patch.dict(salon_app.os.environ, {"REMINDER_SECRET": secret, "CRON_SECRET": "legacy-secret"}),
+            patch.object(salon_app, "reminder_schema_ready", return_value=True),
             patch.object(salon_app, "db_query", return_value=[]),
         ):
             response = self.client.post(

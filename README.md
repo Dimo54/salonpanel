@@ -52,6 +52,89 @@ Preko Brevo servisa aplikacija može slati:
 
 Podsetnici zahtevaju da neki spoljašnji servis pozove zaštićenu adresu `/tasks/send-reminders` jednom na sat.
 
+Podsetnici koriste pravila dospelosti, pa propušten cron ne preskače termin samo
+zato što nije pozvan u uskom vremenskom prozoru: 24h podsetnik važi od 24h do
+2h pre početka, a 2h podsetnik od 2h do samog početka. Termin koji je prvi put
+zakazan unutar 24h ne dobija neadekvatan „sutra” podsetnik, ali ostaje kandidat
+za 2h podsetnik. Svaka promena datuma ili vremena pravi novu verziju rasporeda.
+
+Konvencija vremena za podsetnike je namerna: `appointments.date`/`time`,
+`schedule_started_at` i `reminder_events` `TIMESTAMP` kolone su naive lokalni
+wall-clock vreme u `APP_TIMEZONE`; novi reminder upisi eksplicitno uklanjaju
+timezone tek nakon konverzije u tu zonu. Samo vrednosti koje predstavljaju
+globalni trenutak (npr. Paddle) koriste `TIMESTAMPTZ`/UTC. Istorijski naive
+`created_at` nije sam po sebi dokaz svoje zone i ne konvertuje se bez operatorove
+izričite odluke u rollout koraku.
+
+### Objavljivanje pouzdanih podsetnika
+
+1. Napraviti proverljiv Supabase backup i sačuvati izlaz `pg_dump`/backup job-a.
+2. Zaustaviti reminder cron tokom migracije i deploy prelaza. Proveriti da je
+   PostgreSQL `TimeZone` jednak `APP_TIMEZONE` (podrazumevano `Europe/Belgrade`).
+3. Pre migracije pregledati stvarni tip i semantiku istorijskog
+   `appointments.created_at`. Naive `timestamp` nije dokaz ni UTC ni lokalnog
+   vremena: operator mora na osnovu poznatog istorijskog zapisa odabrati
+   `local-wall-clock` ili `utc`; bez toga se migracija namerno prekida. Jedini
+   izuzetak je eksplicitni `legacy-past-only`: dozvoljen je samo kada read-only
+   dokaz pokaže da je svaki postojeći termin strogo pre današnjeg datuma u
+   `APP_TIMEZONE`. Migracija tada pod transakcionim lock-om ponavlja proveru,
+   ne čita niti konvertuje `created_at`, i upisuje neutralni legacy anchor
+   `date 00:00` u `schedule_started_at`. To nije vreme zakazivanja niti
+   stvaranja termina; prošli termini nikada nisu reminder-due.
+   Isključivo read-only provere su: `SELECT data_type FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'appointments' AND
+   column_name = 'created_at';`, `SHOW TimeZone;` i poređenje nekoliko poznatih
+   vremena nastanka termina sa `created_at`. Uporediti i tadašnji `APP_TIMEZONE`
+   u Render konfiguraciji/logovima; zaključak i uzorke zabeležiti u rollout
+   zapisu pre bilo kakve migracije. Ne birati konvenciju na osnovu pretpostavke.
+4. Za `legacy-past-only` maintenance prozor mora da blokira i nova zakazivanja
+   od početka migracije do deploy-a novog koda. Uz `legacy-past-only` migracija
+   zato postavlja database-level write guard: neizmenjeni stari proces ne može
+   da INSERT/UPDATE/DELETE-uje `appointments` ni posle commita, uključujući
+   Render old/new overlap. Nova aplikacija propušta guard samo kada je
+   `SALONPANEL_APPOINTMENT_WRITE_FREEZE` eksplicitno isključen. Pre migracije
+   deploy-ovati freeze-aware kompatibilnu reviziju sa flagom `1` i potvrditi da
+   su booking/status/delete zahtevi odbijeni pre bilo kakvog slanja emaila.
+   Sačekati da Render potvrdi da je stara instanca ugašena pre pokretanja
+   migracije. PostgreSQL lock/recheck i guard zatvaraju preostalu DB write trku,
+   ali ne mogu povući email koji bi sirovi stari delete handler poslao pre svog
+   SQL `DELETE`. Cron mora ostati zaustavljen. Ne tretirati samu izmenu Render
+   env varijable kao trenutnu promenu već pokrenutog procesa.
+5. Iz kontrolisanog operator okruženja uraditi dry-run, zatim `--apply` sa
+   tačnim `--expected-database`, `--expected-timezone`, deklarisanom
+   `--history-timestamp-convention` i potvrdom oblika
+   `APPLY-REMINDER-MIGRATIONS:production:IME_BAZE`; zatim uraditi `--check`.
+   Runner nikada ne stavlja `DATABASE_URL` u process argv i proverava stvarni
+   `current_database()`, timezone, tipove/ograničenja/indekse i backfill.
+   Migracija ima `lock_timeout = 5s`; aktivni PostgreSQL lock može tražiti
+   ponavljanje u mirnom prozoru, umesto beskonačnog čekanja.
+6. Migracija je idempotentna: istorijske `email_events` uspehe prepisuje u
+   `reminder_events`, bez NULL/orphan zapisa. Novi kod pre claim-a proverava
+   legacy v1 evidenciju i dual-write-uje uspešne poruke u `email_events`.
+7. Deploy-ovati novu verziju sa `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1`.
+   Sačekati završetak deploy-a i proveriti startup/smoke zahteve; tek tada
+   postaviti varijablu na `0` i izvršiti još jedan deploy istog SHA. Stari
+   procesi ostaju blokirani database guard-om čak i dok se gase. `init_db()` na
+   postojećoj bazi više ne sme napraviti reminder šemu; endpoint vraća 503 dok
+   kontrolisana migracija nije kompletna.
+8. Ponovo uključiti cron tek posle uspešnog `--check`. Pozvati ga sa
+   testnom/staging bazom i mock Brevo kredencijalima, zatim u produkciji proveriti
+   samo logove i redove `reminder_events` bez slanja test poruka stvarnim primaocima.
+9. Za rollback zaustaviti novi cron i ne vraćati sirovi `a8fa83d` ako je
+   korišćen `legacy-past-only`: njegov kod ne može proći persistent appointment
+   write guard. Vratiti samo pripremljenu freeze-aware kompatibilnu reviziju uz
+   `SALONPANEL_APPOINTMENT_WRITE_FREEZE=1`, zadržati nove kolone/tabelu i
+   proveriti legacy evidenciju pre bilo kakvog ponovnog uključivanja crona.
+   Stari kod ne povećava `schedule_version` pri pomeranju termina, pa se
+   scheduling ne odmrzava bez eksplicitne procene tog rizika.
+
+Rezervacija pre poziva Brevo-u sprečava paralelne cron duplikate i omogućava
+ograničene retry-je posle istekle rezervacije. Potpuni exactly-once email ipak
+nije moguće garantovati: proces može pasti nakon što Brevo prihvati poruku, a
+pre nego što aplikacija upiše uspeh. Za to bi bila potrebna provajderova
+idempotency podrška ili potvrđen outbox API. Isto važi za pad između novog i
+legacy dual-write-a; rollback zato zahteva zaustavljen cron i proveru evidencije.
+
 ### 5. Pravila online zakazivanja
 
 Salon može podesiti:

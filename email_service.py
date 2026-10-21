@@ -143,7 +143,7 @@ def send_appointment_message(data, message_type):
             f"Termin otkazan - {data.get('salon_name') or 'SalonPanel'}",
         ),
         "reminder_24h": (
-            "Podsetnik za termin sutra",
+            "Podsetnik za predstojeći termin",
             f"Zdravo {client_name}, podsećamo vas na termin u salonu <strong>{salon_name}</strong>.",
             "Ako ne možete da dođete, obavestite salon na vreme.",
             f"Podsetnik za termin - {data.get('salon_name') or 'SalonPanel'}",
